@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -12,7 +12,14 @@ import {
 	isCodexSummaryCredentialUnavailableError,
 	parseCcSwitchProviderLocalConfig,
 	resolveCodexSummaryRoute,
-} from "../extensions/codex-summary-route.ts";
+} from "../lib/codex-summary-route.ts";
+
+test("helper modules stay outside Pi's auto-discovered extensions directory", () => {
+	const entrypoints = readdirSync(new URL("../extensions/", import.meta.url))
+		.filter((name) => name.endsWith(".ts"))
+		.sort();
+	assert.deepEqual(entrypoints, ["cc-switch-provider.ts"]);
+});
 
 test("the checked-in loopback example contains only route metadata", () => {
 	const example = JSON.parse(readFileSync(new URL("../config/cc-switch-provider.example.json", import.meta.url), "utf8"));

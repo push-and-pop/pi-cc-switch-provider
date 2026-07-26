@@ -28,7 +28,7 @@ import {
 	type CodexSummaryRoute,
 	isCodexSummaryCredentialUnavailableError,
 	resolveCodexSummaryRoute,
-} from "./codex-summary-route.ts";
+} from "../lib/codex-summary-route.ts";
 
 type AuthKind = "api-key" | "bearer";
 

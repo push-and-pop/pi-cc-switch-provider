@@ -18,7 +18,7 @@
   },
   "scripts": {
     "test": "node --experimental-strip-types --test tests/codex-summary-route.test.mjs",
-    "check": "node --experimental-strip-types --check extensions/codex-summary-route.ts && node --experimental-strip-types --check extensions/cc-switch-provider.ts"
+    "check": "node --experimental-strip-types --check lib/codex-summary-route.ts && node --experimental-strip-types --check extensions/cc-switch-provider.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

@@ -278,7 +278,7 @@ npm test
 npm run check
 ```
 
-The tests cover summary-route resolution, loopback/HTTPS boundaries, credential-reference validation, and a static guard against reintroducing SQLite credential scraping.
+The tests cover summary-route resolution, loopback/HTTPS boundaries, credential-reference validation, extension-entrypoint auto-discovery boundaries, and a static guard against reintroducing SQLite credential scraping.
 
 ### Security
 
@@ -567,7 +567,7 @@ npm test
 npm run check
 ```
 
-测试覆盖摘要路由解析、loopback/HTTPS 边界、凭据引用校验，并用静态检查防止重新引入 SQLite 凭据抓取。
+测试覆盖摘要路由解析、loopback/HTTPS 边界、凭据引用校验、扩展入口自动发现边界，并用静态检查防止重新引入 SQLite 凭据抓取。
 
 ### 安全说明
 
