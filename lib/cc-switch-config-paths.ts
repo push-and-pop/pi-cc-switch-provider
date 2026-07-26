@@ -44,8 +44,9 @@ export function ccSwitchSettingsPath(homeDirectory: string): string {
 }
 
 /**
- * Read only CC Switch's device-local CLI directory metadata. Provider payloads,
- * database contents, API keys, and every unrelated settings field are ignored.
+ * Project only CC Switch's device-local CLI directory metadata. Provider
+ * payloads, database contents, API keys, and unrelated settings fields are
+ * never returned to the caller.
  */
 export function readCcSwitchCliDirectoryOverrides(homeDirectory: string): CcSwitchCliDirectoryOverrides {
 	const settingsPath = ccSwitchSettingsPath(homeDirectory);
@@ -63,7 +64,7 @@ export function readCcSwitchCliDirectoryOverrides(homeDirectory: string): CcSwit
 	}
 }
 
-/** Mirror CC Switch's supported `~`, `~/...`, and native absolute override forms. */
+/** Resolve the unambiguous `~`, `~/...`, and native absolute forms emitted by CC Switch's picker. */
 export function resolveCcSwitchDirectoryOverride(
 	rawDirectory: string | undefined,
 	homeDirectory: string,

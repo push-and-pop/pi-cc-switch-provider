@@ -297,10 +297,25 @@ function shouldLogFcappAdmissionRetry(attempt: number): boolean {
 	return attempt <= 3 || attempt % 10 === 0;
 }
 
-function isFcappAdmissionNonRetryableBody(body: string): boolean {
-	return /insufficient[ _-]?(balance|credit|funds|quota)|available balance|quota exceeded|out of budget|billing|payment required|invalid.?api.?key|unauthorized|forbidden/i.test(
-		body,
-	);
+// 余额/配额类失败：重试不会变好，任何状态码下都直接放弃。
+const NON_RETRYABLE_BILLING_PATTERN =
+	/insufficient[ _-]?(balance|credit|funds|quota)|available balance|quota exceeded|out of budget|billing|payment required/i;
+// 鉴权类文案：只有在 401/402/403 这种「确实是我们自己的凭证有问题」时才算致命。
+const NON_RETRYABLE_AUTH_PATTERN = /invalid.?api.?key|unauthorized|forbidden/i;
+const CLIENT_AUTH_STATUSES = new Set([401, 402, 403]);
+
+/**
+ * 判断失败是否值得重试。
+ *
+ * 关键区分：中转会把「自己上游号池的账号问题」也报成 5xx/429，例如
+ * `502 {"type":"upstream_error","message":"Upstream access forbidden"}`——
+ * 那是轮换到了一个没有该模型权限的上游账号，换一次重试通常就能过，
+ * 不能因为文案里有 forbidden 就当成鉴权失败直接放弃（实测同一份代码同一中转，
+ * 有时 502 forbidden、有时正常返回）。只有状态码本身指向客户端凭证问题时才致命。
+ */
+function isNonRetryableFailure(status: number, body: string): boolean {
+	if (NON_RETRYABLE_BILLING_PATTERN.test(body)) return true;
+	return CLIENT_AUTH_STATUSES.has(status) && NON_RETRYABLE_AUTH_PATTERN.test(body);
 }
 
 function cloneResponseWithBody(response: Response, body: string): Response {
@@ -392,7 +407,7 @@ async function fetchWithBoundedUpstreamRetry(
 
 			const body = await safeResponseText(response);
 			lastResponse = cloneResponseWithBody(response, body);
-			if (isFcappAdmissionNonRetryableBody(body)) return lastResponse;
+			if (isNonRetryableFailure(response.status, body)) return lastResponse;
 			if (attempt === maxAttempts) return lastResponse;
 
 			const delayMs = parseRetryAfterMs(response) ?? upstreamRetryDelayMs(attempt);
@@ -435,7 +450,7 @@ async function fetchWithUpstreamRetry(
 			if (!FCAPP_ADMISSION_RETRY_STATUSES.has(response.status)) return response;
 
 			const body = await safeResponseText(response);
-			if (isFcappAdmissionNonRetryableBody(body)) return cloneResponseWithBody(response, body);
+			if (isNonRetryableFailure(response.status, body)) return cloneResponseWithBody(response, body);
 
 			attempt += 1;
 			const delayMs = fcappAdmissionRetryDelayMs(attempt);
@@ -770,7 +785,7 @@ async function runFcappKeepwarm(
 				}
 				failure = { endpoint, requestUrl, status: result.status, body: result.body };
 				const retryableStatus = FCAPP_ADMISSION_RETRY_STATUSES.has(result.status);
-				if (!retryableStatus || isFcappAdmissionNonRetryableBody(result.body ?? "")) break;
+				if (!retryableStatus || isNonRetryableFailure(result.status, result.body ?? "")) break;
 			} catch (error) {
 				if (!fcappKeepwarmRunActive(generation)) return;
 				failure = {
