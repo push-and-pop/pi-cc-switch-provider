@@ -260,7 +260,7 @@ $env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
 pi --provider cc-switch-codex --model current
 ```
 
-Pi compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies.
+Pi compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies. For both Claude and Codex, when `current` resolves to a live model ID, successful responses report the actual request model, while provider errors retain the logical `current` ID so Pi's same-model overflow guard can compact and retry safely.
 
 ### Upstream Retries
 
@@ -554,7 +554,7 @@ $env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
 pi --provider cc-switch-codex --model current
 ```
 
-Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。
+Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。对于 Claude 和 Codex，`current` 解析到 live 模型后，成功响应会记录实际请求模型；Provider 错误则保留逻辑上的 `current` ID，确保 Pi 的 same-model 溢出检查能够安全触发压缩和重试。
 
 ### 中转重试
 

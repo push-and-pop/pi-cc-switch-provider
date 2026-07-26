@@ -2941,6 +2941,9 @@ function streamCcSwitchCodexResponses(
 			};
 			console.error('[cc-switch Codex Error]', JSON.stringify(errorDetails, null, 2));
 
+			// Pi 的 overflow recovery 要求错误消息的 provider/model 与当前会话模型一致。
+			// current alias 的请求模型会展开成 live model ID；错误消息保留逻辑 ID，才能触发 compact。
+			output.model = model.id;
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				delete (block as { partialJson?: string }).partialJson;
@@ -3092,6 +3095,9 @@ function streamCcSwitchAnthropic(
 			};
 			console.error('[cc-switch Claude Error]', JSON.stringify(errorDetails, null, 2));
 
+			// Pi 的 overflow recovery 要求错误消息的 provider/model 与当前会话模型一致。
+			// current alias 的请求模型会展开成 live model ID；错误消息保留逻辑 ID，才能触发 compact。
+			output.model = model.id;
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				delete (block as { partialJson?: string }).partialJson;
