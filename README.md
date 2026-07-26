@@ -208,6 +208,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 The extension registers `cc-switch-claude/current`, which re-reads `%USERPROFILE%\.claude\settings.json` before each request and follows the current model selected in cc-switch. It also registers the concrete model currently written by cc-switch, such as `mimo-v2.5-pro`.
 
+On top of those, a fixed set is always registered: `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-6`, `claude-sonnet-5`, `claude-sonnet-4-6`. All of them are 1M-context models, so the extension enables the 1M beta and the `xhigh` thinking level for them. Your relay still has to have the corresponding channel enabled — pick an older one if `claude-opus-5` is not available there yet.
+
+The `opus` / `sonnet` / `haiku` aliases in `settings.json` resolve to `claude-opus-5`, `claude-sonnet-5` and `claude-haiku-4-5-20251001` respectively, unless `ANTHROPIC_DEFAULT_*_MODEL` overrides them.
+
 To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claude env config as a comma- or space-separated list.
 
 ### Codex Models
@@ -446,6 +450,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 ### Claude 模型
 
 该扩展会注册 `cc-switch-claude/current`，并在每次请求前重新读取 `%USERPROFILE%\.claude\settings.json`，跟随 cc-switch 当前选择的模型。它也会注册 cc-switch 当前写入的具体模型，例如 `mimo-v2.5-pro`。
+
+在此之外，扩展还会固定注册一组可切换模型：`claude-opus-5`、`claude-opus-4-8`、`claude-opus-4-6`、`claude-sonnet-5`、`claude-sonnet-4-6`。它们都是 1M 上下文模型，扩展会为其开启 1M beta 和 `xhigh` 思考档位。能否真正调用仍取决于中转是否开通对应渠道——如果中转还没有 `claude-opus-5`，选旧版本即可。
+
+`settings.json` 里的 `opus` / `sonnet` / `haiku` 别名分别解析为 `claude-opus-5`、`claude-sonnet-5`、`claude-haiku-4-5-20251001`，除非 `ANTHROPIC_DEFAULT_*_MODEL` 另有覆盖。
 
 如需追加固定模型，可在 cc-switch 的 Claude env 配置中设置 `PI_CC_SWITCH_CLAUDE_MODELS`，使用英文逗号或空格分隔多个模型。
 

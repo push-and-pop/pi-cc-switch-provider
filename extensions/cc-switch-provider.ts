@@ -1,9 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
+import {
+	buildCodexModelIds,
+	clampCodexContextWindow,
+	type CodexCatalogModel,
+	type CodexCatalogStatus,
+	findCodexCatalogModel,
+	loadOwnedCodexModelCatalog,
+	resolveCodexRequestModelId,
+} from "../lib/codex-model-catalog.ts";
 
 import {
 	type Api,
@@ -41,6 +51,8 @@ interface CodexConfig {
 	api: "cc-switch-codex-responses" | "openai-completions";
 	model: string;
 	modelReasoningEffort?: string;
+	catalogModels: CodexCatalogModel[];
+	catalogStatus: CodexCatalogStatus;
 }
 
 interface CcSwitchProviderLocalConfig {
@@ -84,9 +96,18 @@ const CURRENT_CODEX_MODEL_ID = "current";
 const DEFAULT_CODEX_MODELS = ["gpt-5.5", "gpt-5.6-sol"] as const;
 const CODEX_CONFIG_REASONING_MODEL = "gpt-5.6-sol";
 const CURRENT_CLAUDE_MODEL_ID = "current";
-const DEFAULT_CLAUDE_OPUS_MODEL = "claude-opus-4-8";
-const DEFAULT_CLAUDE_SONNET_MODEL = "claude-sonnet-4-6";
+const DEFAULT_CLAUDE_OPUS_MODEL = "claude-opus-5";
+const DEFAULT_CLAUDE_SONNET_MODEL = "claude-sonnet-5";
 const DEFAULT_CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
+// 与 DEFAULT_CODEX_MODELS 同理：除了 cc-switch 当前模型，再固定暴露一组可切换的 Claude 模型。
+// 新增 opus-5 的同时保留 4.8 / 4.6，避免中转只开通旧渠道时无法回退。
+const DEFAULT_CLAUDE_MODELS = [
+	"claude-opus-5",
+	"claude-opus-4-8",
+	"claude-opus-4-6",
+	"claude-sonnet-5",
+	"claude-sonnet-4-6",
+] as const;
 const CONTEXT_1M_BETA = "context-1m-2025-08-07";
 const CLAUDE_CODE_BETAS = [
 	"claude-code-20250219",
@@ -907,12 +928,17 @@ function extractClaudeFromSettings(settings: Record<string, unknown>, env: Recor
 				CURRENT_CLAUDE_MODEL_ID,
 				...(currentModel ? [currentModel] : []),
 				...splitModelList(env.PI_CC_SWITCH_CLAUDE_MODELS),
+				...DEFAULT_CLAUDE_MODELS,
 			]),
 		},
 	};
 }
 
-function extractCodexFromConfigText(apiKey: string, configText: string): ExtractResult<CodexConfig> {
+function extractCodexFromConfigText(
+	apiKey: string,
+	configText: string,
+	configDirectory: string,
+): ExtractResult<CodexConfig> {
 	const toml = parseCodexConfigToml(configText);
 	// cc-switch 的格式：顶层 `model_provider = "<id>"` 指向 `[model_providers.<id>]` section。
 	// 优先按 section 取 base_url / wire_api，回退到顶层（兼容用户手写的扁平 config）。
@@ -936,6 +962,9 @@ function extractCodexFromConfigText(apiKey: string, configText: string): Extract
 		return { ok: false, error: "top-level 'model' missing" };
 	}
 
+	const catalog = loadOwnedCodexModelCatalog(toml.top.model_catalog_json, configDirectory, {
+		fallbackContextWindow: codexContextWindow(),
+	});
 	return {
 		ok: true,
 		config: {
@@ -944,6 +973,8 @@ function extractCodexFromConfigText(apiKey: string, configText: string): Extract
 			api: wireApi === "chat" ? "openai-completions" : "cc-switch-codex-responses",
 			model,
 			modelReasoningEffort: toml.top.model_reasoning_effort,
+			catalogModels: catalog.models,
+			catalogStatus: catalog.status,
 		},
 	};
 }
@@ -1185,6 +1216,7 @@ function installCcSwitchFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 
 				const model = ctx.model;
 				const followsLiveCodex = model?.provider === "cc-switch-codex" &&
+					isCurrentCodexModel(model.id) &&
 					codexConfig.api === "cc-switch-codex-responses" && Boolean(codexConfig.model);
 				const modelName = followsLiveCodex ? (codexConfig.model as string) : (model?.id ?? "no-model");
 				let rightSideWithoutProvider = modelName;
@@ -1390,7 +1422,7 @@ function loadCodexConfig(): CodexConfig | undefined {
 		return undefined;
 	}
 
-	const result = extractCodexFromConfigText(apiKey, configText);
+	const result = extractCodexFromConfigText(apiKey, configText, dirname(configPath));
 	if (!result.ok) {
 		loadDiagnostics.codex = `Codex: ${result.error} in config.toml`;
 		return undefined;
@@ -1467,18 +1499,26 @@ function resolveRuntimeCodexModel(model: Model<Api>, liveConfig?: CodexConfig): 
 	if (!liveConfig || liveConfig.api !== "cc-switch-codex-responses") {
 		return model;
 	}
+	const requestModelId = resolveCodexRequestModelId(model.id, liveConfig.model);
+	const catalogModel = findCodexCatalogModel(liveConfig.catalogModels, requestModelId);
 	return {
 		...model,
-		id: liveConfig.model,
-		name: `cc-switch Codex (${liveConfig.model})`,
+		id: requestModelId,
+		name: isCurrentCodexModel(model.id)
+			? `cc-switch Codex (${requestModelId})`
+			: model.name,
 		baseUrl: liveConfig.baseUrl,
-		input: TEXT_IMAGE_INPUT,
-		contextWindow: codexContextWindow(),
+		reasoning: catalogModel?.reasoning ?? model.reasoning,
+		input: catalogModel?.input ?? model.input ?? TEXT_IMAGE_INPUT,
+		contextWindow: clampCodexContextWindow(
+			catalogModel?.contextWindow ?? model.contextWindow,
+			codexContextWindow(),
+		),
 	};
 }
 
-function codexModels(currentModel: string): string[] {
-	return Array.from(new Set([CURRENT_CODEX_MODEL_ID, currentModel, ...DEFAULT_CODEX_MODELS]));
+function codexModels(currentModel: string, catalogModels: CodexCatalogModel[]): string[] {
+	return buildCodexModelIds(currentModel, catalogModels, DEFAULT_CODEX_MODELS);
 }
 
 function resolveRuntimeCodexApiKey(options: SimpleStreamOptions | undefined, liveConfig?: CodexConfig): string | undefined {
@@ -2752,7 +2792,11 @@ function streamCcSwitchCodexResponses(
 			const requestBaseUrl = summaryRoute?.baseUrl ?? runtimeModel.baseUrl;
 			const requestApiKey = summaryRoute?.apiKey ?? apiKey;
 			const requestModelId = summaryRoute?.model ?? runtimeModel.id;
-			const primaryPayload = buildOpenAIResponsesPayload(runtimeModel, context, options, liveCodex?.modelReasoningEffort);
+			const runtimeReasoningEffort = liveCodex &&
+				(isCurrentCodexModel(model.id) || model.id === liveCodex.model)
+				? liveCodex.modelReasoningEffort
+				: undefined;
+			const primaryPayload = buildOpenAIResponsesPayload(runtimeModel, context, options, runtimeReasoningEffort);
 			const payload = requestModelId === runtimeModel.id ? primaryPayload : { ...primaryPayload, model: requestModelId };
 			const headers: Record<string, string> = {
 				accept: "text/event-stream",
@@ -3005,17 +3049,20 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: codex.baseUrl,
 			apiKey: codex.apiKey,
 			api: codex.api as Api,
-			models: codexModels(codex.model).map((model) => {
+			models: codexModels(codex.model, codex.catalogModels).map((model) => {
 				const displayModel = isCurrentCodexModel(model) ? codex.model : model;
+				const catalogModel = findCodexCatalogModel(codex.catalogModels, displayModel);
 				return {
 					id: model,
 					name: isCurrentCodexModel(model)
 						? `cc-switch Codex (current: ${displayModel})`
-						: `cc-switch Codex (${model})`,
-					reasoning: true,
-					input: codex.api === "cc-switch-codex-responses" ? TEXT_IMAGE_INPUT : TEXT_INPUT,
+						: `cc-switch Codex (${catalogModel?.name ?? model})`,
+					reasoning: catalogModel?.reasoning ?? true,
+					input: codex.api === "cc-switch-codex-responses"
+						? (catalogModel?.input ?? TEXT_IMAGE_INPUT)
+						: TEXT_INPUT,
 					cost: ZERO_COST,
-					contextWindow: codexContextWindow(),
+					contextWindow: clampCodexContextWindow(catalogModel?.contextWindow, codexContextWindow()),
 					maxTokens: 64000,
 				};
 			}),
@@ -3035,7 +3082,7 @@ export default function (pi: ExtensionAPI) {
 					? `Claude: current=${liveClaude.currentModel ?? "unknown"}; models=${liveClaude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${liveClaude.baseUrl}`
 					: loadDiagnostics.claude ?? "Claude: no ~/.claude/settings.json provider found",
 				liveCodex
-					? `Codex: cc-switch-codex/${liveCodex.model} -> ${liveCodex.baseUrl}`
+					? `Codex: cc-switch-codex/${liveCodex.model} -> ${liveCodex.baseUrl}; catalog=${liveCodex.catalogStatus === "loaded" ? `cc-switch/${liveCodex.catalogModels.length}` : `fallback/${liveCodex.catalogStatus}`}`
 					: loadDiagnostics.codex ?? "Codex: no ~/.codex provider found",
 				liveCodex ? codexSummaryRouteStatus(liveCodex) : "Codex Summary: unavailable",
 				fcappKeepwarmStatusLine(),
