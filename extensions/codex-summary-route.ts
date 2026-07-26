@@ -10,6 +10,21 @@ export const CODEX_SUMMARY_PROXY_AUTH_REF = "cc-switch-proxy" as const;
 export const CC_SWITCH_PROXY_TOKEN_PLACEHOLDER = "PROXY_MANAGED";
 export const CC_SWITCH_PROVIDER_CONFIG_FILE = "cc-switch-provider.json";
 
+const CODEX_SUMMARY_CREDENTIAL_ERROR_NAME = "CodexSummaryCredentialUnavailableError";
+
+export class CodexSummaryCredentialUnavailableError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = CODEX_SUMMARY_CREDENTIAL_ERROR_NAME;
+	}
+}
+
+export function isCodexSummaryCredentialUnavailableError(
+	error: unknown,
+): error is CodexSummaryCredentialUnavailableError {
+	return error instanceof Error && error.name === CODEX_SUMMARY_CREDENTIAL_ERROR_NAME;
+}
+
 const FCAPP_ADMISSION_RETRY_HOST = "a-ocnfniawgw.cn-shanghai.fcapp.run";
 
 type SummaryAuthRef = typeof CODEX_SUMMARY_ENV_AUTH_REF | typeof CODEX_SUMMARY_PROXY_AUTH_REF;
@@ -180,7 +195,9 @@ export function resolveCodexSummaryRoute(
 		? CC_SWITCH_PROXY_TOKEN_PLACEHOLDER
 		: environmentApiKey;
 	if (!apiKey) {
-		throw new Error(`独立压缩中转凭据不可用；请在本地进程环境中设置 ${CODEX_SUMMARY_API_KEY_ENV}`);
+		throw new CodexSummaryCredentialUnavailableError(
+			`独立压缩中转凭据不可用；请在本地进程环境中设置 ${CODEX_SUMMARY_API_KEY_ENV}`,
+		);
 	}
 
 	return {

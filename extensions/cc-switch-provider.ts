@@ -24,7 +24,11 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { resolveCodexSummaryRoute } from "./codex-summary-route.ts";
+import {
+	type CodexSummaryRoute,
+	isCodexSummaryCredentialUnavailableError,
+	resolveCodexSummaryRoute,
+} from "./codex-summary-route.ts";
 
 type AuthKind = "api-key" | "bearer";
 
@@ -35,6 +39,8 @@ interface ClaudeConfig {
 	models: string[];
 	currentModel?: string;
 }
+
+type ClaudeSummaryFallbackConfig = ClaudeConfig & { currentModel: string };
 
 interface CodexConfig {
 	baseUrl: string;
@@ -67,6 +73,7 @@ const CODEX_CONTEXT_WINDOW_ENV = "PI_CC_SWITCH_CODEX_CONTEXT_WINDOW";
 const DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO = 0.85;
 const CC_SWITCH_EARLY_COMPACTION_ENV = "PI_CC_SWITCH_EARLY_COMPACTION";
 const CC_SWITCH_COMPACTION_AUTO_RESUME_ENV = "PI_CC_SWITCH_COMPACTION_AUTO_RESUME";
+const CODEX_SUMMARY_CLAUDE_FALLBACK_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK";
 const CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_RATIO";
 const CC_SWITCH_COMPACTION_TRIGGER_TOKENS_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS";
 const CC_SWITCH_COMPACTION_STATUS_KEY = "cc-switch-compaction";
@@ -237,6 +244,10 @@ function ccSwitchEarlyCompactionEnabled(): boolean {
 
 function ccSwitchCompactionAutoResumeEnabled(): boolean {
 	return enabledByDefaultEnv(CC_SWITCH_COMPACTION_AUTO_RESUME_ENV);
+}
+
+function codexSummaryClaudeFallbackEnabled(): boolean {
+	return enabledByDefaultEnv(CODEX_SUMMARY_CLAUDE_FALLBACK_ENV);
 }
 
 function ccSwitchCompactionTriggerTokens(contextWindow: number): number {
@@ -1277,6 +1288,46 @@ function installCcSwitchFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	});
 }
 
+function codexSummaryClaudeFallbackConfig(): ClaudeSummaryFallbackConfig | undefined {
+	if (!codexSummaryClaudeFallbackEnabled()) return undefined;
+	const liveClaude = loadClaudeConfig();
+	if (!liveClaude?.currentModel || !supportsOneMillionContext(liveClaude.currentModel)) return undefined;
+	return { ...liveClaude, currentModel: liveClaude.currentModel };
+}
+
+function codexSummaryClaudeFallbackModel(claude: ClaudeSummaryFallbackConfig): Model<Api> {
+	const displayModel = claude.currentModel;
+	return {
+		id: CURRENT_CLAUDE_MODEL_ID,
+		name: `cc-switch Claude summary fallback (${displayModel})`,
+		api: "cc-switch-anthropic" as Api,
+		provider: "cc-switch-claude",
+		baseUrl: claude.baseUrl,
+		reasoning: true,
+		thinkingLevelMap: { xhigh: "xhigh" },
+		input: TEXT_IMAGE_INPUT,
+		cost: ZERO_COST,
+		contextWindow: claudeContextWindow(displayModel),
+		maxTokens: 64000,
+	};
+}
+
+function streamCodexSummaryViaClaude(
+	context: Context,
+	options: SimpleStreamOptions | undefined,
+	reason: string,
+): AssistantMessageEventStream | undefined {
+	const claude = codexSummaryClaudeFallbackConfig();
+	if (!claude) return undefined;
+	console.warn(`[cc-switch] Codex summary is using the configured 1M Claude route: ${reason}`);
+	return streamCcSwitchAnthropic(
+		claude.authKind,
+		codexSummaryClaudeFallbackModel(claude),
+		context,
+		options,
+	);
+}
+
 function codexSummaryRouteStatus(codex: CodexConfig): string {
 	if (!isFcappAdmissionRetryEndpoint(codex.baseUrl)) {
 		return `Codex Summary: 跟随当前中转 ${codex.baseUrl}`;
@@ -1284,12 +1335,21 @@ function codexSummaryRouteStatus(codex: CodexConfig): string {
 	try {
 		const route = resolveCodexSummaryRoute({ liveModel: codex.model });
 		if (!route) {
-			return "Codex Summary: 跟随当前中转（未配置独立路由）";
+			const fallback = codexSummaryClaudeFallbackConfig();
+			return fallback
+				? `Codex Summary: 回退 cc-switch-claude/${fallback.currentModel} -> ${fallback.baseUrl} [1M Claude]`
+				: "Codex Summary: 跟随当前中转（未配置独立路由）";
 		}
 		const sourceLabel = route.configSource === "environment" ? "环境变量配置" : "本地引用配置";
 		const authLabel = route.authSource === "cc-switch-proxy" ? "CC Switch 代理认证" : "进程环境认证";
 		return `Codex Summary: ${route.model} -> ${route.baseUrl} [FC 独立压缩/${sourceLabel}/${authLabel}]`;
 	} catch (error) {
+		if (isCodexSummaryCredentialUnavailableError(error)) {
+			const fallback = codexSummaryClaudeFallbackConfig();
+			if (fallback) {
+				return `Codex Summary: 独立路由缺少凭据；回退 cc-switch-claude/${fallback.currentModel} -> ${fallback.baseUrl} [1M Claude]`;
+			}
+		}
 		return `Codex Summary: 配置错误 ${error instanceof Error ? error.message : String(error)}`;
 	}
 }
@@ -2705,9 +2765,31 @@ function streamCcSwitchCodexResponses(
 			if (!apiKey) throw new Error("Missing cc-switch Codex credential");
 
 			const useIndependentSummaryRoute = isSummarizationContext(context) && isFcappAdmissionRetryEndpoint(runtimeModel.baseUrl);
-			const summaryRoute = useIndependentSummaryRoute
-				? resolveCodexSummaryRoute({ liveModel: runtimeModel.id })
-				: undefined;
+			let summaryRoute: CodexSummaryRoute | undefined;
+			if (useIndependentSummaryRoute) {
+				try {
+					summaryRoute = resolveCodexSummaryRoute({ liveModel: runtimeModel.id });
+				} catch (error) {
+					if (isCodexSummaryCredentialUnavailableError(error)) {
+						const fallback = streamCodexSummaryViaClaude(context, options, "independent Codex route has no credential");
+						if (fallback) {
+							for await (const event of fallback) stream.push(event);
+							stream.end();
+							return;
+						}
+					}
+					throw error;
+				}
+
+				if (!summaryRoute) {
+					const fallback = streamCodexSummaryViaClaude(context, options, "independent Codex route is not configured");
+					if (fallback) {
+						for await (const event of fallback) stream.push(event);
+						stream.end();
+						return;
+					}
+				}
+			}
 			const requestBaseUrl = summaryRoute?.baseUrl ?? runtimeModel.baseUrl;
 			const requestApiKey = summaryRoute?.apiKey ?? apiKey;
 			const requestModelId = summaryRoute?.model ?? runtimeModel.id;

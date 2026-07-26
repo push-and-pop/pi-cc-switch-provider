@@ -245,6 +245,9 @@ $env:PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS = "220000"
 
 # Disable automatic continuation after compaction interrupts a tool-use turn.
 $env:PI_CC_SWITCH_COMPACTION_AUTO_RESUME = "0"
+
+# Disable the safe 1M Claude summary fallback for an FC Codex route.
+$env:PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK = "0"
 ```
 
 Run `/cc-switch` to inspect the effective threshold. Context usage counts cached input once because cached tokens still occupy the model's context: the Responses adapter subtracts the cached subset from `input` and records it separately as `cacheRead`. The check happens after a model turn, never in the middle of a request or tool execution. Pi's compactor aborts the pending agent continuation while generating the summary. After a successful automatic compaction, the extension sends a hidden continuation message when the interrupted turn still had tool work to finish; completed turns do not start an extra model turn. If a user message is already queued, compaction is deferred rather than discarding it. The post-compaction crossing state also prevents another immediate compaction merely because the summary and retained recent messages already occupy substantial context.
@@ -264,7 +267,9 @@ The extension keeps the normal Codex/CC Switch route by default. When the active
 }
 ```
 
-With `cc-switch-proxy`, the route must be HTTP loopback and the extension sends CC Switch's non-secret `PROXY_MANAGED` placeholder. When `model` is omitted on either a loopback or explicitly authorized external route, the active live Codex model is reused; set `model` only to override it. For an external summary relay, use `authRef: "env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"` and provide the credential only in the local process environment. The file must never contain `apiKey`, token, or Authorization values. `PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` and `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` override the file metadata. The extension no longer reads or parses `~/.cc-switch/cc-switch.db`. Existing configurations that relied on automatic database discovery must now declare the auth reference when using an external route; no database credentials are migrated automatically. If no explicit summary route is configured, it falls back to the current route instead of a hidden hard-coded third-party endpoint.
+With `cc-switch-proxy`, the route must be HTTP loopback and the extension sends CC Switch's non-secret `PROXY_MANAGED` placeholder. When `model` is omitted on either a loopback or explicitly authorized external route, the active live Codex model is reused; set `model` only to override it. For an external summary relay, use `authRef: "env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"` and provide the credential only in the local process environment. The file must never contain `apiKey`, token, or Authorization values. `PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` and `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` override the file metadata. The extension no longer reads or parses `~/.cc-switch/cc-switch.db`. Existing configurations that relied on automatic database discovery must now declare the auth reference when using an external route; no database credentials are migrated automatically.
+
+When the active Codex endpoint is the known FC route, and the independent route is either absent or missing its dedicated credential, the extension can safely generate the summary through an already configured **1M `cc-switch-claude` live route**. Claude's credential is sent only to Claude's own configured base URL; Codex credentials are never copied across hosts. Invalid route metadata and other security validation failures still fail closed instead of silently falling back. Set `PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK=0` to disable this behavior. If no eligible 1M Claude route exists, an unconfigured independent route continues to use the current Codex route.
 
 ### Development checks
 
@@ -529,6 +534,9 @@ $env:PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS = "220000"
 
 # 关闭工具调用 turn 被压缩中断后的自动续跑。
 $env:PI_CC_SWITCH_COMPACTION_AUTO_RESUME = "0"
+
+# 关闭 Codex FC 路由的安全 1M Claude 摘要兜底。
+$env:PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK = "0"
 ```
 
 可运行 `/cc-switch` 查看当前生效阈值。缓存命中的输入仍会占用模型上下文，因此需要计入一次；Responses 适配器会先从 `input` 中减去 cached 子集，再将其单独记录为 `cacheRead`，不会重复相加。检查只发生在模型 turn 结束后，不会在请求或工具执行中途压缩。Pi 压缩器生成摘要时会中止尚待继续的 Agent 运行；自动压缩成功后，如果被中断的 turn 仍有工具任务需要完成，扩展会发送一条隐藏续跑消息，已正常完成的 turn 不会额外启动模型。如果已有用户消息排队，则推迟压缩，避免丢弃该消息。扩展也会保留压缩后的阈值越界状态，不会仅因摘要和最近保留消息已占用较多上下文而立即再次压缩。
@@ -548,7 +556,9 @@ $env:PI_CC_SWITCH_COMPACTION_AUTO_RESUME = "0"
 }
 ```
 
-使用 `cc-switch-proxy` 时，路由必须是 HTTP loopback，扩展只发送 CC Switch 的非敏感占位符 `PROXY_MANAGED`。无论 loopback 还是已明确授权的外部路由，省略 `model` 时都会复用当前实际 Codex 模型；仅在需要覆盖时设置 `model`。外部摘要中转应将 `authRef` 写成 `"env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"`，并且只在本地进程环境中提供凭据。配置文件禁止出现 `apiKey`、token 或 Authorization 值。`PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` 和 `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` 会覆盖文件中的路由元数据。原来依赖 `cc-switch.db` 自动发现的外部摘要路由配置，现在必须显式声明 auth reference；扩展不会自动迁移数据库中的凭据。未配置独立摘要路由时，会回退到当前路由，不再隐式访问硬编码的第三方地址。
+使用 `cc-switch-proxy` 时，路由必须是 HTTP loopback，扩展只发送 CC Switch 的非敏感占位符 `PROXY_MANAGED`。无论 loopback 还是已明确授权的外部路由，省略 `model` 时都会复用当前实际 Codex 模型；仅在需要覆盖时设置 `model`。外部摘要中转应将 `authRef` 写成 `"env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"`，并且只在本地进程环境中提供凭据。配置文件禁止出现 `apiKey`、token 或 Authorization 值。`PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` 和 `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` 会覆盖文件中的路由元数据。原来依赖 `cc-switch.db` 自动发现的外部摘要路由配置，现在必须显式声明 auth reference；扩展不会自动迁移数据库中的凭据。
+
+当前 Codex endpoint 为已知 FC 路由，且独立路由未配置或缺少自己的凭据时，扩展可以安全地通过已经配置的 **1M `cc-switch-claude` live 路由**生成摘要。Claude 凭据只会发送到 Claude 自己配置的 base URL，绝不会跨域复制 Codex 凭据；非法路由元数据及其它安全校验错误仍会直接失败，不会被静默掩盖。可设置 `PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK=0` 关闭该行为。如果不存在符合条件的 1M Claude 路由，未配置独立路由时才继续回退当前 Codex route。
 
 ### 开发验证
 

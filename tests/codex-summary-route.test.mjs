@@ -9,6 +9,7 @@ import {
 	CODEX_SUMMARY_ENV_AUTH_REF,
 	CODEX_SUMMARY_MODEL_ENV,
 	CODEX_SUMMARY_PROXY_AUTH_REF,
+	isCodexSummaryCredentialUnavailableError,
 	parseCcSwitchProviderLocalConfig,
 	resolveCodexSummaryRoute,
 } from "../extensions/codex-summary-route.ts";
@@ -136,8 +137,9 @@ test("external routes cannot claim the CC Switch proxy auth reference", () => {
 });
 
 test("external routes fail closed when the environment credential is missing", () => {
-	assert.throws(
-		() => resolveCodexSummaryRoute({
+	let caught;
+	try {
+		resolveCodexSummaryRoute({
 			environment: {},
 			localConfig: {
 				codexSummary: {
@@ -146,9 +148,14 @@ test("external routes fail closed when the environment credential is missing", (
 					authRef: CODEX_SUMMARY_ENV_AUTH_REF,
 				},
 			},
-		}),
-		new RegExp(CODEX_SUMMARY_API_KEY_ENV),
-	);
+		});
+		assert.fail("missing summary credential should throw");
+	} catch (error) {
+		caught = error;
+	}
+	assert.ok(caught instanceof Error);
+	assert.match(caught.message, new RegExp(CODEX_SUMMARY_API_KEY_ENV));
+	assert.equal(isCodexSummaryCredentialUnavailableError(caught), true);
 });
 
 test("malformed route metadata fails instead of silently falling back", () => {
