@@ -100,10 +100,13 @@ const DEFAULT_CLAUDE_OPUS_MODEL = "claude-opus-5";
 const DEFAULT_CLAUDE_SONNET_MODEL = "claude-sonnet-5";
 const DEFAULT_CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 // 与 DEFAULT_CODEX_MODELS 同理：除了 cc-switch 当前模型，再固定暴露一组可切换的 Claude 模型。
-// 新增 opus-5 的同时保留 4.8 / 4.6，避免中转只开通旧渠道时无法回退。
+// 新增 opus-5 的同时保留 4.8 / 4.7 / 4.6：中转开通的渠道各不相同，匹配不到渠道的模型
+// 会被 oneapi 类中转以 429「Upstream rate limit exceeded」拒掉，所以这里多留几级可回退。
 const DEFAULT_CLAUDE_MODELS = [
+	"claude-fable-5",
 	"claude-opus-5",
 	"claude-opus-4-8",
+	"claude-opus-4-7",
 	"claude-opus-4-6",
 	"claude-sonnet-5",
 	"claude-sonnet-4-6",
@@ -120,6 +123,14 @@ const FCAPP_KEEPWARM_FALLBACK_BASE_URL = "https://anyrouter.top";
 const FCAPP_ADMISSION_RETRY_BASE_DELAY_MS = 1000;
 const FCAPP_ADMISSION_RETRY_MAX_DELAY_MS = 15000;
 const FCAPP_ADMISSION_RETRY_STATUSES = new Set([408, 429, 499, 500, 502, 503, 504]);
+// 非 FC 中转的通用重试：对齐官方 SDK 的 max_retries=2（共 3 次尝试）+ 指数退避 + 认 retry-after。
+// 中转的 429「Upstream rate limit exceeded」多半是瞬时限流，官方 CLI 会静默重试吃掉，
+// 这里不重试的话同一个中转在 Pi 里就会比 claude 命令行更容易报错。
+const UPSTREAM_RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504, 529]);
+const UPSTREAM_RETRY_MAX_ATTEMPTS = 3;
+const UPSTREAM_RETRY_BASE_DELAY_MS = 500;
+const UPSTREAM_RETRY_MAX_DELAY_MS = 8000;
+const UPSTREAM_RETRY_AFTER_MAX_MS = 30000;
 const FCAPP_KEEPWARM_ENABLED_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM";
 const FCAPP_KEEPWARM_MODE_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM_MODE";
 const FCAPP_KEEPWARM_INTERVAL_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM_INTERVAL_MS";
@@ -313,13 +324,85 @@ async function safeResponseText(response: Response): Promise<string> {
 	}
 }
 
-async function fetchWithFcappAdmissionRetry(
+/** 解析 retry-after（秒数或 HTTP date），越界/非法一律返回 undefined 交给指数退避。 */
+function parseRetryAfterMs(response: Response): number | undefined {
+	const raw = response.headers.get("retry-after");
+	if (!raw) return undefined;
+	const trimmed = raw.trim();
+
+	const seconds = Number(trimmed);
+	if (Number.isFinite(seconds)) {
+		if (seconds < 0) return undefined;
+		return Math.min(UPSTREAM_RETRY_AFTER_MAX_MS, Math.round(seconds * 1000));
+	}
+
+	const at = Date.parse(trimmed);
+	if (Number.isNaN(at)) return undefined;
+	const delta = at - Date.now();
+	if (delta <= 0) return 0;
+	return Math.min(UPSTREAM_RETRY_AFTER_MAX_MS, delta);
+}
+
+function upstreamRetryDelayMs(attempt: number): number {
+	const baseDelay = Math.min(UPSTREAM_RETRY_MAX_DELAY_MS, UPSTREAM_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
+	const jitter = 0.85 + Math.random() * 0.3;
+	return Math.min(UPSTREAM_RETRY_MAX_DELAY_MS, Math.round(baseDelay * jitter));
+}
+
+/**
+ * 通用中转重试：限流/网络抖动重试固定次数后放弃，把最后一次响应原样交回调用方。
+ *
+ * 与 FC 的入场重试不同——那边是「无限等名额」，这里是「别让一次瞬时 429 打断会话」。
+ * 请求体是已经序列化好的字符串，重放安全；余额/鉴权类错误直接返回，不浪费重试次数。
+ */
+async function fetchWithBoundedUpstreamRetry(
+	url: string,
+	init: RequestInit,
+	label: string,
+): Promise<Response> {
+	let lastResponse: Response | undefined;
+
+	for (let attempt = 1; attempt <= UPSTREAM_RETRY_MAX_ATTEMPTS; attempt += 1) {
+		if (init.signal?.aborted) throw new Error("Request was aborted");
+
+		try {
+			const response = await fetch(url, init);
+			if (!UPSTREAM_RETRY_STATUSES.has(response.status)) return response;
+
+			const body = await safeResponseText(response);
+			lastResponse = cloneResponseWithBody(response, body);
+			if (isFcappAdmissionNonRetryableBody(body)) return lastResponse;
+			if (attempt === UPSTREAM_RETRY_MAX_ATTEMPTS) return lastResponse;
+
+			const delayMs = parseRetryAfterMs(response) ?? upstreamRetryDelayMs(attempt);
+			console.warn(
+				`[cc-switch ${label}] upstream retry ${attempt}/${UPSTREAM_RETRY_MAX_ATTEMPTS - 1}: HTTP ${response.status}; retrying in ${delayMs}ms. ${body.slice(0, 200)}`,
+			);
+			await abortableDelay(delayMs, init.signal ?? undefined);
+		} catch (error) {
+			if (init.signal?.aborted || !isFcappAdmissionRetryableError(error)) throw error;
+			if (attempt === UPSTREAM_RETRY_MAX_ATTEMPTS) throw error;
+
+			const delayMs = upstreamRetryDelayMs(attempt);
+			const message = error instanceof Error ? error.message : String(error);
+			console.warn(
+				`[cc-switch ${label}] upstream retry ${attempt}/${UPSTREAM_RETRY_MAX_ATTEMPTS - 1}: ${message}; retrying in ${delayMs}ms.`,
+			);
+			await abortableDelay(delayMs, init.signal ?? undefined);
+		}
+	}
+
+	// 循环内已覆盖所有出口，这里只是给 TS 一个兜底。
+	return lastResponse ?? fetch(url, init);
+}
+
+async function fetchWithUpstreamRetry(
 	url: string,
 	init: RequestInit,
 	label: string,
 ): Promise<Response> {
 	if (!isFcappAdmissionRetryEndpoint(url)) {
-		return fetch(url, init);
+		return fetchWithBoundedUpstreamRetry(url, init, label);
 	}
 
 	let attempt = 0;
@@ -2807,7 +2890,7 @@ function streamCcSwitchCodexResponses(
 			const endpoint = endpointForOpenAIResponses(requestBaseUrl);
 			const route = summaryRoute ? "fc-independent-summary" : "primary";
 			writeDebugRequest(headers, payload, context, { route, endpoint, primaryEndpoint: summaryRoute ? endpointForOpenAIResponses(runtimeModel.baseUrl) : undefined });
-			const response = await fetchWithFcappAdmissionRetry(endpoint, {
+			const response = await fetchWithUpstreamRetry(endpoint, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
@@ -2925,7 +3008,7 @@ function streamCcSwitchAnthropic(
 			const payload = buildAnthropicPayload(runtimeModel, context, sessionId, options);
 			writeDebugRequest(headers, payload, context);
 			const endpoint = endpointForAnthropicMessages(runtimeModel.baseUrl);
-			const response = await fetchWithFcappAdmissionRetry(endpoint, {
+			const response = await fetchWithUpstreamRetry(endpoint, {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
@@ -3052,6 +3135,7 @@ export default function (pi: ExtensionAPI) {
 			models: codexModels(codex.model, codex.catalogModels).map((model) => {
 				const displayModel = isCurrentCodexModel(model) ? codex.model : model;
 				const catalogModel = findCodexCatalogModel(codex.catalogModels, displayModel);
+				const contextWindow = clampCodexContextWindow(catalogModel?.contextWindow, codexContextWindow());
 				return {
 					id: model,
 					name: isCurrentCodexModel(model)
@@ -3062,8 +3146,8 @@ export default function (pi: ExtensionAPI) {
 						? (catalogModel?.input ?? TEXT_IMAGE_INPUT)
 						: TEXT_INPUT,
 					cost: ZERO_COST,
-					contextWindow: clampCodexContextWindow(catalogModel?.contextWindow, codexContextWindow()),
-					maxTokens: 64000,
+					contextWindow,
+					maxTokens: Math.min(64000, contextWindow),
 				};
 			}),
 			...(codex.api === "cc-switch-codex-responses"

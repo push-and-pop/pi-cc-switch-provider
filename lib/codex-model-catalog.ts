@@ -6,11 +6,12 @@ export const DEFAULT_CODEX_MODEL_CATALOG_MAX_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_CODEX_MODEL_CATALOG_MAX_MODELS = 512;
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
+const MIN_CONTEXT_WINDOW = 1_024;
 const MAX_CONTEXT_WINDOW = 10_000_000;
 const MAX_MODEL_ID_LENGTH = 256;
 const MAX_MODEL_NAME_LENGTH = 256;
 
-type CodexCatalogInput = "text" | "image";
+export type CodexCatalogInput = "text" | "image";
 
 export interface CodexCatalogModel {
 	id: string;
@@ -49,6 +50,12 @@ function isAbsoluteOnAnyPlatform(filePath: string): boolean {
 	return isAbsolute(filePath) || posix.isAbsolute(filePath) || win32.isAbsolute(filePath);
 }
 
+function normalizeAbsolutePath(filePath: string): string {
+	if (win32.isAbsolute(filePath)) return win32.normalize(filePath);
+	if (posix.isAbsolute(filePath)) return posix.normalize(filePath);
+	return normalize(filePath);
+}
+
 export function resolveOwnedCodexCatalogPath(
 	catalogPointer: string | undefined,
 	configDirectory: string,
@@ -56,7 +63,7 @@ export function resolveOwnedCodexCatalogPath(
 	const pointer = catalogPointer?.trim();
 	if (!pointer || catalogFileName(pointer) !== CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME) return undefined;
 
-	if (isAbsoluteOnAnyPlatform(pointer)) return normalize(pointer);
+	if (isAbsoluteOnAnyPlatform(pointer)) return normalizeAbsolutePath(pointer);
 	// CC Switch resolves every owned relative pointer to its generated file in the Codex config directory.
 	return join(configDirectory, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
 }
@@ -74,7 +81,7 @@ function positiveContextWindow(value: unknown): number | undefined {
 		: typeof value === "string" && /^\d+$/.test(value.trim())
 			? Number.parseInt(value.trim(), 10)
 			: Number.NaN;
-	if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > MAX_CONTEXT_WINDOW) return undefined;
+	if (!Number.isSafeInteger(parsed) || parsed < MIN_CONTEXT_WINDOW || parsed > MAX_CONTEXT_WINDOW) return undefined;
 	return parsed;
 }
 
@@ -130,7 +137,7 @@ export function parseCodexModelCatalog(
 		if (!value || typeof value !== "object" || Array.isArray(value)) continue;
 		const entry = value as Record<string, unknown>;
 		const id = normalizedString(entry.slug, MAX_MODEL_ID_LENGTH);
-		if (!id || seen.has(id)) continue;
+		if (!id || /\s/.test(id) || seen.has(id)) continue;
 		seen.add(id);
 
 		models.push({

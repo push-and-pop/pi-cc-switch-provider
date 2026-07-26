@@ -10,7 +10,7 @@ Pi extension that reads the active cc-switch output files and registers Pi provi
 
 ### Requirements
 
-- Node.js 20+
+- Node.js 22.19+
 - Pi installed globally
 - cc-switch installed and configured on the same Windows user account
 
@@ -208,7 +208,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 The extension registers `cc-switch-claude/current`, which re-reads `%USERPROFILE%\.claude\settings.json` before each request and follows the current model selected in cc-switch. It also registers the concrete model currently written by cc-switch, such as `mimo-v2.5-pro`.
 
-On top of those, a fixed set is always registered: `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-6`, `claude-sonnet-5`, `claude-sonnet-4-6`. All of them are 1M-context models, so the extension enables the 1M beta and the `xhigh` thinking level for them. Your relay still has to have the corresponding channel enabled — pick an older one if `claude-opus-5` is not available there yet.
+On top of those, a fixed set is always registered: `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, `claude-sonnet-4-6`. All of them are 1M-context models, so the extension enables the 1M beta and the `xhigh` thinking level for them. Your relay still has to have the corresponding channel enabled — oneapi-style relays reject an unknown model with a `429 Upstream rate limit exceeded` rather than a clear error, so fall back to an older model if one of them keeps failing.
 
 The `opus` / `sonnet` / `haiku` aliases in `settings.json` resolve to `claude-opus-5`, `claude-sonnet-5` and `claude-haiku-4-5-20251001` respectively, unless `ANTHROPIC_DEFAULT_*_MODEL` overrides them.
 
@@ -216,7 +216,11 @@ To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claud
 
 ### Codex Models
 
-The extension registers `cc-switch-codex/current`, which re-reads `%USERPROFILE%\.codex\config.toml` before each request and follows the current model selected in cc-switch. It also registers the concrete current model plus fixed entries for `gpt-5.5` and `gpt-5.6-sol`.
+The extension registers `cc-switch-codex/current`, which re-reads `%USERPROFILE%\.codex\config.toml` before each request and follows the current model selected in cc-switch.
+
+At startup or `/reload`, when the top-level `model_catalog_json` points to the CC Switch-owned filename `cc-switch-model-catalog.json`, the extension imports the catalog's validated model IDs, display names, context windows, reasoning flag, and input modalities. A valid non-empty catalog replaces the fixed Codex list. If the pointer is absent, user-owned, missing, oversized, malformed, or empty, the extension preserves the legacy fallback: the concrete current model plus `gpt-5.5` and `gpt-5.6-sol`.
+
+Only the `current` alias follows later live model changes. Selecting a concrete catalog model sends that selected model ID. Catalog context windows are capped by `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` (200,000 by default), and the importer ignores every catalog field outside its metadata allowlist. Restart Pi or run `/reload` after CC Switch changes the catalog.
 
 When the effective model is `gpt-5.6-sol`, normal Responses requests use the top-level `model_reasoning_effort` value from `config.toml` directly as `reasoning.effort` (including provider-specific values such as `ultra`) instead of mapping through Pi's built-in thinking levels. The interactive footer watches `config.toml` and displays this effective value instead of the Shift+Tab level. Compaction and branch-summary requests keep their existing recovery-specific reasoning behavior.
 
@@ -237,13 +241,25 @@ pi --provider cc-switch-codex --model current
 
 Pi compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies.
 
+### Development Checks
+
+```powershell
+npm test
+npm run check
+```
+
+The tests use Node's native TypeScript stripping and cover catalog ownership, size/count limits, metadata projection, fallback behavior, concrete-model selection, and context-window capping.
+
 ### Security
 
-Do not commit cc-switch credentials. This package only reads local files created by cc-switch:
+Do not commit cc-switch credentials. Provider registration and model discovery read these local runtime files:
 
 - `%USERPROFILE%\.claude\settings.json`
 - `%USERPROFILE%\.codex\auth.json`
 - `%USERPROFILE%\.codex\config.toml`
+- `%USERPROFILE%\.codex\cc-switch-model-catalog.json`, only when `config.toml` points to the CC Switch-owned filename
+
+The catalog importer reads only allowlisted model metadata and never reads Provider credentials from the catalog. The restored legacy FC summary-route implementation still reads `%USERPROFILE%\.cc-switch\cc-switch.db`; removing that behavior remains a separate tracked task.
 
 ---
 
@@ -253,7 +269,7 @@ Do not commit cc-switch credentials. This package only reads local files created
 
 ### 环境要求
 
-- Node.js 20+
+- Node.js 22.19+
 - 已全局安装 Pi
 - 已在同一个 Windows 用户账号下安装并配置 cc-switch
 
@@ -451,7 +467,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 该扩展会注册 `cc-switch-claude/current`，并在每次请求前重新读取 `%USERPROFILE%\.claude\settings.json`，跟随 cc-switch 当前选择的模型。它也会注册 cc-switch 当前写入的具体模型，例如 `mimo-v2.5-pro`。
 
-在此之外，扩展还会固定注册一组可切换模型：`claude-opus-5`、`claude-opus-4-8`、`claude-opus-4-6`、`claude-sonnet-5`、`claude-sonnet-4-6`。它们都是 1M 上下文模型，扩展会为其开启 1M beta 和 `xhigh` 思考档位。能否真正调用仍取决于中转是否开通对应渠道——如果中转还没有 `claude-opus-5`，选旧版本即可。
+在此之外，扩展还会固定注册一组可切换模型：`claude-fable-5`、`claude-opus-5`、`claude-opus-4-8`、`claude-opus-4-7`、`claude-opus-4-6`、`claude-sonnet-5`、`claude-sonnet-4-6`。它们都是 1M 上下文模型，扩展会为其开启 1M beta 和 `xhigh` 思考档位。能否真正调用仍取决于中转是否开通对应渠道——oneapi 类中转匹配不到模型时不会给出明确报错，而是返回 `429 Upstream rate limit exceeded`，某个模型持续失败就换旧版本。
 
 `settings.json` 里的 `opus` / `sonnet` / `haiku` 别名分别解析为 `claude-opus-5`、`claude-sonnet-5`、`claude-haiku-4-5-20251001`，除非 `ANTHROPIC_DEFAULT_*_MODEL` 另有覆盖。
 
@@ -463,7 +479,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 ### Codex 模型
 
-该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取 `%USERPROFILE%\.codex\config.toml`，跟随 cc-switch 当前选择的模型。同时会注册当前具体模型，并固定额外注册 `gpt-5.5` 和 `gpt-5.6-sol`。
+该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取 `%USERPROFILE%\.codex\config.toml`，跟随 cc-switch 当前选择的模型。
+
+启动或执行 `/reload` 时，如果顶层 `model_catalog_json` 指向 CC Switch 所有的文件名 `cc-switch-model-catalog.json`，扩展会导入 catalog 中通过校验的模型 ID、显示名、上下文窗口、reasoning 标记和输入模态。有效且非空的 catalog 会替代固定 Codex 列表；如果指针缺失、属于用户自定义文件、文件不存在、过大、格式错误或为空，则保留旧回退列表：当前具体模型以及 `gpt-5.5`、`gpt-5.6-sol`。
+
+只有 `current` alias 会继续跟随之后的 live 模型变化；选择 catalog 中的具体模型时，请求会保留该模型 ID。catalog 上下文仍受 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` 限制（默认 200,000），导入器会忽略元数据白名单之外的全部字段。CC Switch 修改 catalog 后，需要重启 Pi 或执行 `/reload`。
 
 实际模型为 `gpt-5.6-sol` 时，普通 Responses 请求会直接读取 `config.toml` 顶层的 `model_reasoning_effort`，并原样作为 `reasoning.effort` 发送（包括 `ultra` 等中转自定义值），不再经过 Pi 内置 thinking 档位映射。交互式页脚会监听 `config.toml`，并用该实际生效值覆盖 Shift+Tab 档位显示。上下文压缩和分支摘要请求继续保留既有的恢复专用 reasoning 策略。
 
@@ -480,11 +500,23 @@ pi --provider cc-switch-codex --model current
 
 Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。
 
+### 开发验证
+
+```powershell
+npm test
+npm run check
+```
+
+测试使用 Node 原生 TypeScript stripping，覆盖 catalog ownership、大小/数量限制、元数据投影、回退行为、具体模型选择和上下文上限。
+
 ### 安全说明
 
-不要提交 cc-switch 凭据。本包只读取 cc-switch 在本地创建的文件：
+不要提交 cc-switch 凭据。Provider 注册与模型发现会读取以下本地运行时文件：
 
 - `%USERPROFILE%\.claude\settings.json`
 - `%USERPROFILE%\.codex\auth.json`
 - `%USERPROFILE%\.codex\config.toml`
+- `%USERPROFILE%\.codex\cc-switch-model-catalog.json`，且仅当 `config.toml` 指向 CC Switch 所有的文件名时
+
+catalog 导入器只读取白名单模型元数据，不从 catalog 读取 Provider 凭据。当前已还原的 legacy FC summary route 仍会读取 `%USERPROFILE%\.cc-switch\cc-switch.db`；移除该行为仍是另一项已跟踪任务。
 
