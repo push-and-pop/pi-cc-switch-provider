@@ -204,11 +204,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 | `pi-codex` | `pi --provider cc-switch-codex --model current` | Start Pi with the cc-switch Codex provider quickly. |
 | `pi-claude` | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | Start Pi with the cc-switch Claude provider quickly. |
 
+### CC Switch Config Directories
+
+The extension reads CC Switch's device-local `%USERPROFILE%\.cc-switch\settings.json` only for the `claudeConfigDir` and `codexConfigDir` path metadata. Those overrides relocate all imported live files, including the Claude settings file and Codex `auth.json`, `config.toml`, model catalog, and interactive footer watcher. If no override is present, the existing `%USERPROFILE%\.claude` and `%USERPROFILE%\.codex` defaults remain unchanged. Claude's legacy `claude.json` filename is also honored when `settings.json` is absent.
+
+Absolute paths and CC Switch's `~` forms are accepted. Ambiguous relative paths fail closed to the default directories because Pi and the CC Switch GUI can have different working directories. Restart Pi or run `/reload` after changing a directory in CC Switch. No Provider payload, API key, database content, or unrelated CC Switch setting is imported by this path resolver.
+
 ### Claude Models
 
-The extension registers `cc-switch-claude/current`, which re-reads `%USERPROFILE%\.claude\settings.json` before each request and follows the current model selected in cc-switch. It also registers the concrete model currently written by cc-switch, such as `mimo-v2.5-pro`.
+The extension registers `cc-switch-claude/current`, which re-reads the active Claude settings file before each request and follows the current model selected in cc-switch. It also registers the concrete model currently written by cc-switch, such as `mimo-v2.5-pro`.
 
-On top of those, a fixed set is always registered: `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, `claude-sonnet-4-6`. All of them are 1M-context models, so the extension enables the 1M beta and the `xhigh` thinking level for them. Your relay still has to have the corresponding channel enabled — oneapi-style relays reject an unknown model with a `429 Upstream rate limit exceeded` rather than a clear error, so fall back to an older model if one of them keeps failing.
+On top of those, a fixed set is always registered: `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, `claude-sonnet-4-6`. All of them are 1M-context models, so the extension enables the 1M beta and the `xhigh` thinking level for them. Your relay still has to have the corresponding channel enabled; fall back to an older model if one of them keeps failing.
+
+Note that a `429 Upstream rate limit exceeded` from a relay is not always a real rate limit — relays reuse that status for request rejection in general. See Upstream Retries below before assuming the relay is busy.
 
 The `opus` / `sonnet` / `haiku` aliases in `settings.json` resolve to `claude-opus-5`, `claude-sonnet-5` and `claude-haiku-4-5-20251001` respectively, unless `ANTHROPIC_DEFAULT_*_MODEL` overrides them.
 
@@ -216,7 +224,7 @@ To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claud
 
 ### Codex Models
 
-The extension registers `cc-switch-codex/current`, which re-reads `%USERPROFILE%\.codex\config.toml` before each request and follows the current model selected in cc-switch.
+The extension registers `cc-switch-codex/current`, which re-reads the active Codex `config.toml` before each request and follows the current model selected in cc-switch.
 
 At startup or `/reload`, when the top-level `model_catalog_json` points to the CC Switch-owned filename `cc-switch-model-catalog.json`, the extension imports the catalog's validated model IDs, display names, context windows, reasoning flag, and input modalities. A valid non-empty catalog replaces the fixed Codex list. If the pointer is absent, user-owned, missing, oversized, malformed, or empty, the extension preserves the legacy fallback: the concrete current model plus `gpt-5.5` and `gpt-5.6-sol`.
 
@@ -241,6 +249,20 @@ pi --provider cc-switch-codex --model current
 
 Pi compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies.
 
+### Upstream Retries
+
+Requests that fail with `408`, `429`, `500`, `502`, `503`, `504`, or `529` are retried with exponential backoff and jitter (500ms up to 15s per wait, honouring `retry-after`). The default budget is 8 attempts, roughly 45s of waiting in the worst case — account-pool relays flap between `429 Upstream rate limit exceeded` and `503 No available accounts` for tens of seconds when their pool is saturated. Bodies that indicate an insufficient balance or an auth problem are returned immediately instead of burning the budget.
+
+**Retrying does not help a rejected request, and a relay `429` is often a rejection rather than a real rate limit.** Relays fingerprint requests to detect non-Claude-Code clients and answer `429 Upstream rate limit exceeded` when a request looks forged — identical on every attempt. One such trigger was measured on 2026-07-26: sending `metadata.user_id` as Claude Code's full identity envelope (`device_id` + `account_uuid` + `session_id` together) failed 0/5 while the pool was healthy and plain `curl` succeeded 5/5. The extension now sends a single stable hash instead. If every attempt fails with the same status while a minimal `curl` to the same relay and model succeeds, look for a fingerprint trigger rather than raising the retry budget.
+
+Set `PI_CC_SWITCH_UPSTREAM_RETRY_ATTEMPTS` to change the budget (`1` disables retrying):
+
+```powershell
+$env:PI_CC_SWITCH_UPSTREAM_RETRY_ATTEMPTS = "12"
+```
+
+The dedicated FC endpoint keeps its own unbounded admission retry and is unaffected by this setting.
+
 ### Development Checks
 
 ```powershell
@@ -248,18 +270,18 @@ npm test
 npm run check
 ```
 
-The tests use Node's native TypeScript stripping and cover catalog ownership, size/count limits, metadata projection, fallback behavior, concrete-model selection, and context-window capping.
+The tests use Node's native TypeScript stripping and cover CC Switch CLI-directory override resolution, catalog ownership, size/count limits, metadata projection, fallback behavior, concrete-model selection, and context-window capping. `npm run check` is a stripped-TypeScript syntax check, not a strict `tsc` typecheck.
 
 ### Security
 
-Do not commit cc-switch credentials. Provider registration and model discovery read these local runtime files:
+Do not commit cc-switch credentials. The path resolver reads `%USERPROFILE%\.cc-switch\settings.json` only for the allowlisted `claudeConfigDir` and `codexConfigDir` metadata. Provider registration and model discovery then read these local runtime files from the resolved directories:
 
-- `%USERPROFILE%\.claude\settings.json`
-- `%USERPROFILE%\.codex\auth.json`
-- `%USERPROFILE%\.codex\config.toml`
-- `%USERPROFILE%\.codex\cc-switch-model-catalog.json`, only when `config.toml` points to the CC Switch-owned filename
+- `<Claude config directory>\settings.json` (or legacy `claude.json`)
+- `<Codex config directory>\auth.json`
+- `<Codex config directory>\config.toml`
+- `<Codex config directory>\cc-switch-model-catalog.json`, only when `config.toml` points to the CC Switch-owned filename
 
-The catalog importer reads only allowlisted model metadata and never reads Provider credentials from the catalog. The restored legacy FC summary-route implementation still reads `%USERPROFILE%\.cc-switch\cc-switch.db`; removing that behavior remains a separate tracked task.
+The directory resolver ignores every unrelated CC Switch setting, and the catalog importer reads only allowlisted model metadata and never reads Provider credentials from the catalog. The restored legacy FC summary-route implementation still reads `%USERPROFILE%\.cc-switch\cc-switch.db`; removing that behavior remains a separate tracked task.
 
 ---
 
@@ -463,11 +485,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 | `pi-codex` | `pi --provider cc-switch-codex --model current` | 快速使用 cc-switch Codex provider 启动 Pi。 |
 | `pi-claude` | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | 快速使用 cc-switch Claude provider 启动 Pi。 |
 
+### CC Switch 配置目录
+
+扩展只会从 CC Switch 的设备级 `%USERPROFILE%\.cc-switch\settings.json` 读取 `claudeConfigDir` 和 `codexConfigDir` 两项路径元数据。这两个覆盖会同时迁移所有导入的 live 文件，包括 Claude settings、Codex `auth.json` / `config.toml` / model catalog，以及交互式页脚的文件监听。未配置覆盖时，仍使用原来的 `%USERPROFILE%\.claude` 与 `%USERPROFILE%\.codex` 默认目录；Claude 目录中没有 `settings.json` 时，也兼容旧文件名 `claude.json`。
+
+支持绝对路径和 CC Switch 的 `~` 写法。相对路径存在 Pi 与 CC Switch GUI 工作目录不一致的歧义，因此会安全回退默认目录。通过 CC Switch 修改目录后，请重启 Pi 或执行 `/reload`。路径解析器不会导入 Provider 内容、API Key、数据库内容或其它无关 CC Switch 设置。
+
 ### Claude 模型
 
-该扩展会注册 `cc-switch-claude/current`，并在每次请求前重新读取 `%USERPROFILE%\.claude\settings.json`，跟随 cc-switch 当前选择的模型。它也会注册 cc-switch 当前写入的具体模型，例如 `mimo-v2.5-pro`。
+该扩展会注册 `cc-switch-claude/current`，并在每次请求前重新读取当前生效的 Claude settings 文件，跟随 cc-switch 当前选择的模型。它也会注册 cc-switch 当前写入的具体模型，例如 `mimo-v2.5-pro`。
 
-在此之外，扩展还会固定注册一组可切换模型：`claude-fable-5`、`claude-opus-5`、`claude-opus-4-8`、`claude-opus-4-7`、`claude-opus-4-6`、`claude-sonnet-5`、`claude-sonnet-4-6`。它们都是 1M 上下文模型，扩展会为其开启 1M beta 和 `xhigh` 思考档位。能否真正调用仍取决于中转是否开通对应渠道——oneapi 类中转匹配不到模型时不会给出明确报错，而是返回 `429 Upstream rate limit exceeded`，某个模型持续失败就换旧版本。
+在此之外，扩展还会固定注册一组可切换模型：`claude-fable-5`、`claude-opus-5`、`claude-opus-4-8`、`claude-opus-4-7`、`claude-opus-4-6`、`claude-sonnet-5`、`claude-sonnet-4-6`。它们都是 1M 上下文模型，扩展会为其开启 1M beta 和 `xhigh` 思考档位。能否真正调用仍取决于中转是否开通对应渠道，某个模型持续失败就换旧版本。
+
+注意中转返回的 `429 Upstream rate limit exceeded` 未必是真的限流——中转会用这个状态码兜底各种拒绝。先看下面的「中转重试」一节，别急着认定是中转忙。
 
 `settings.json` 里的 `opus` / `sonnet` / `haiku` 别名分别解析为 `claude-opus-5`、`claude-sonnet-5`、`claude-haiku-4-5-20251001`，除非 `ANTHROPIC_DEFAULT_*_MODEL` 另有覆盖。
 
@@ -479,7 +509,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 ### Codex 模型
 
-该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取 `%USERPROFILE%\.codex\config.toml`，跟随 cc-switch 当前选择的模型。
+该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取当前生效的 Codex `config.toml`，跟随 cc-switch 当前选择的模型。
 
 启动或执行 `/reload` 时，如果顶层 `model_catalog_json` 指向 CC Switch 所有的文件名 `cc-switch-model-catalog.json`，扩展会导入 catalog 中通过校验的模型 ID、显示名、上下文窗口、reasoning 标记和输入模态。有效且非空的 catalog 会替代固定 Codex 列表；如果指针缺失、属于用户自定义文件、文件不存在、过大、格式错误或为空，则保留旧回退列表：当前具体模型以及 `gpt-5.5`、`gpt-5.6-sol`。
 
@@ -500,6 +530,20 @@ pi --provider cc-switch-codex --model current
 
 Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。
 
+### 中转重试
+
+返回 `408`、`429`、`500`、`502`、`503`、`504`、`529` 的请求会按指数退避加抖动重试（单次等待 500ms 至 15s，优先遵守 `retry-after`），默认预算 8 次尝试、最坏约 45 秒。号池型中转在账号被占满时，会在 `429 Upstream rate limit exceeded` 和 `503 No available accounts` 之间抖动几十秒。响应体判定为余额不足或鉴权失败时会立即返回，不浪费重试预算。
+
+**被拒绝的请求重试多少次都没用，而中转的 `429` 往往就是拒绝而非限流。** 中转会对请求做指纹识别以发现非 Claude Code 客户端，判定为伪造时同样返回 `429 Upstream rate limit exceeded`，且每次尝试结果完全一致。2026-07-26 实测到一个触发点：`metadata.user_id` 发送 Claude Code 的完整身份信封（`device_id` + `account_uuid` + `session_id` 三者同时出现）时，在池子健康、裸 `curl` 5/5 成功的同时该请求 0/5 全挂。扩展现已改为只发单个稳定哈希。如果每次尝试都是同一个状态码，而同中转同模型的最小 `curl` 能成功，应该去找指纹触发点，而不是加大重试预算。
+
+如需调整预算，可设置 `PI_CC_SWITCH_UPSTREAM_RETRY_ATTEMPTS`（设为 `1` 即关闭重试）：
+
+```powershell
+$env:PI_CC_SWITCH_UPSTREAM_RETRY_ATTEMPTS = "12"
+```
+
+FC 专用域名保留原有的无限入场重试，不受该设置影响。
+
 ### 开发验证
 
 ```powershell
@@ -507,16 +551,16 @@ npm test
 npm run check
 ```
 
-测试使用 Node 原生 TypeScript stripping，覆盖 catalog ownership、大小/数量限制、元数据投影、回退行为、具体模型选择和上下文上限。
+测试使用 Node 原生 TypeScript stripping，覆盖 CC Switch CLI 目录覆盖解析、catalog ownership、大小/数量限制、元数据投影、回退行为、具体模型选择和上下文上限。`npm run check` 是剥离 TypeScript 类型后的语法检查，并不等同于严格的 `tsc` 类型检查。
 
 ### 安全说明
 
-不要提交 cc-switch 凭据。Provider 注册与模型发现会读取以下本地运行时文件：
+不要提交 cc-switch 凭据。路径解析器只会从 `%USERPROFILE%\.cc-switch\settings.json` 读取白名单内的 `claudeConfigDir` 与 `codexConfigDir` 元数据。Provider 注册与模型发现随后从解析出的目录读取以下本地运行时文件：
 
-- `%USERPROFILE%\.claude\settings.json`
-- `%USERPROFILE%\.codex\auth.json`
-- `%USERPROFILE%\.codex\config.toml`
-- `%USERPROFILE%\.codex\cc-switch-model-catalog.json`，且仅当 `config.toml` 指向 CC Switch 所有的文件名时
+- `<Claude 配置目录>\settings.json`（或旧文件名 `claude.json`）
+- `<Codex 配置目录>\auth.json`
+- `<Codex 配置目录>\config.toml`
+- `<Codex 配置目录>\cc-switch-model-catalog.json`，且仅当 `config.toml` 指向 CC Switch 所有的文件名时
 
-catalog 导入器只读取白名单模型元数据，不从 catalog 读取 Provider 凭据。当前已还原的 legacy FC summary route 仍会读取 `%USERPROFILE%\.cc-switch\cc-switch.db`；移除该行为仍是另一项已跟踪任务。
+目录解析器会忽略其它全部 CC Switch 设置；catalog 导入器只读取白名单模型元数据，不从 catalog 读取 Provider 凭据。当前已还原的 legacy FC summary route 仍会读取 `%USERPROFILE%\.cc-switch\cc-switch.db`；移除该行为仍是另一项已跟踪任务。
 

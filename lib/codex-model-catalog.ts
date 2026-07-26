@@ -51,9 +51,11 @@ function isAbsoluteOnAnyPlatform(filePath: string): boolean {
 }
 
 function normalizeAbsolutePath(filePath: string): string {
+	// Prefer the host platform first: both win32 and posix classify `/foo` as
+	// absolute, but win32 normalization would corrupt a native Unix path.
+	if (isAbsolute(filePath)) return normalize(filePath);
 	if (win32.isAbsolute(filePath)) return win32.normalize(filePath);
-	if (posix.isAbsolute(filePath)) return posix.normalize(filePath);
-	return normalize(filePath);
+	return posix.normalize(filePath);
 }
 
 export function resolveOwnedCodexCatalogPath(

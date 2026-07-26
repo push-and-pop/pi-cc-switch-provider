@@ -6,6 +6,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import {
+	type CcSwitchCliPaths,
+	resolveCcSwitchCliPaths,
+} from "../lib/cc-switch-config-paths.ts";
+
+import {
 	buildCodexModelIds,
 	clampCodexContextWindow,
 	type CodexCatalogModel,
@@ -127,9 +132,12 @@ const FCAPP_ADMISSION_RETRY_STATUSES = new Set([408, 429, 499, 500, 502, 503, 50
 // 中转的 429「Upstream rate limit exceeded」多半是瞬时限流，官方 CLI 会静默重试吃掉，
 // 这里不重试的话同一个中转在 Pi 里就会比 claude 命令行更容易报错。
 const UPSTREAM_RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504, 529]);
-const UPSTREAM_RETRY_MAX_ATTEMPTS = 3;
+// 号池型中转被占满时会在 429 / 503「No available accounts」之间反复抖动，几秒内是恢复不了的。
+// 官方 claude CLI 会一直重试到池子放人，所以这里的预算要按「几十秒」而不是「几秒」来给。
+const UPSTREAM_RETRY_DEFAULT_MAX_ATTEMPTS = 8;
+const UPSTREAM_RETRY_MAX_ATTEMPTS_ENV = "PI_CC_SWITCH_UPSTREAM_RETRY_ATTEMPTS";
 const UPSTREAM_RETRY_BASE_DELAY_MS = 500;
-const UPSTREAM_RETRY_MAX_DELAY_MS = 8000;
+const UPSTREAM_RETRY_MAX_DELAY_MS = 15000;
 const UPSTREAM_RETRY_AFTER_MAX_MS = 30000;
 const FCAPP_KEEPWARM_ENABLED_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM";
 const FCAPP_KEEPWARM_MODE_ENV = "PI_CC_SWITCH_FCAPP_KEEPWARM_MODE";
@@ -195,6 +203,14 @@ let fcappKeepwarmSuccessCount = 0;
 
 // 加载阶段的诊断信息：扩展启动时没有 ctx，缓存到模块状态，等首个 session_start 再 notify。
 const loadDiagnostics: { claude?: string; codex?: string } = {};
+
+// CC Switch 明确要求修改 CLI 配置目录后重启；Pi 侧对应在扩展加载或 /reload 时解析一次，
+// 避免 settings.json 非原子写入窗口导致单个请求瞬时回退到另一套默认凭据。
+let activeCcSwitchCliPaths: CcSwitchCliPaths | undefined;
+
+function ccSwitchCliPaths(): CcSwitchCliPaths {
+	return activeCcSwitchCliPaths ??= resolveCcSwitchCliPaths(homedir());
+}
 
 // 中转网关上下文溢出文案归一化模式。pi 只识别少数标准文案才会触发自动 compact 重试，
 // 这里把常见几类映射成 "context_length_exceeded"。负向列表避免误把限流/配额当成溢出。
@@ -343,6 +359,10 @@ function parseRetryAfterMs(response: Response): number | undefined {
 	return Math.min(UPSTREAM_RETRY_AFTER_MAX_MS, delta);
 }
 
+function upstreamRetryMaxAttempts(): number {
+	return positiveIntegerEnv(UPSTREAM_RETRY_MAX_ATTEMPTS_ENV) ?? UPSTREAM_RETRY_DEFAULT_MAX_ATTEMPTS;
+}
+
 function upstreamRetryDelayMs(attempt: number): number {
 	const baseDelay = Math.min(UPSTREAM_RETRY_MAX_DELAY_MS, UPSTREAM_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
 	const jitter = 0.85 + Math.random() * 0.3;
@@ -360,9 +380,10 @@ async function fetchWithBoundedUpstreamRetry(
 	init: RequestInit,
 	label: string,
 ): Promise<Response> {
+	const maxAttempts = upstreamRetryMaxAttempts();
 	let lastResponse: Response | undefined;
 
-	for (let attempt = 1; attempt <= UPSTREAM_RETRY_MAX_ATTEMPTS; attempt += 1) {
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
 		if (init.signal?.aborted) throw new Error("Request was aborted");
 
 		try {
@@ -372,21 +393,21 @@ async function fetchWithBoundedUpstreamRetry(
 			const body = await safeResponseText(response);
 			lastResponse = cloneResponseWithBody(response, body);
 			if (isFcappAdmissionNonRetryableBody(body)) return lastResponse;
-			if (attempt === UPSTREAM_RETRY_MAX_ATTEMPTS) return lastResponse;
+			if (attempt === maxAttempts) return lastResponse;
 
 			const delayMs = parseRetryAfterMs(response) ?? upstreamRetryDelayMs(attempt);
 			console.warn(
-				`[cc-switch ${label}] upstream retry ${attempt}/${UPSTREAM_RETRY_MAX_ATTEMPTS - 1}: HTTP ${response.status}; retrying in ${delayMs}ms. ${body.slice(0, 200)}`,
+				`[cc-switch ${label}] upstream retry ${attempt}/${maxAttempts - 1}: HTTP ${response.status}; retrying in ${delayMs}ms. ${body.slice(0, 200)}`,
 			);
 			await abortableDelay(delayMs, init.signal ?? undefined);
 		} catch (error) {
 			if (init.signal?.aborted || !isFcappAdmissionRetryableError(error)) throw error;
-			if (attempt === UPSTREAM_RETRY_MAX_ATTEMPTS) throw error;
+			if (attempt === maxAttempts) throw error;
 
 			const delayMs = upstreamRetryDelayMs(attempt);
 			const message = error instanceof Error ? error.message : String(error);
 			console.warn(
-				`[cc-switch ${label}] upstream retry ${attempt}/${UPSTREAM_RETRY_MAX_ATTEMPTS - 1}: ${message}; retrying in ${delayMs}ms.`,
+				`[cc-switch ${label}] upstream retry ${attempt}/${maxAttempts - 1}: ${message}; retrying in ${delayMs}ms.`,
 			);
 			await abortableDelay(delayMs, init.signal ?? undefined);
 		}
@@ -939,7 +960,7 @@ function uniqueStrings(values: string[]): string[] {
 //
 // 把"从 env / settings_config 对象提取 Claude/Codex 配置"剥离成纯函数，
 // 让两条数据源共享同一套提取逻辑：
-//   - live-file 路径：读 ~/.claude/settings.json / ~/.codex/* → 进对应纯函数
+//   - live-file 路径：按 CC Switch 的 Claude/Codex 目录覆盖解析活动文件 → 进对应纯函数
 //   - SQLite 路径：读 ~/.cc-switch/cc-switch.db 的 settings_config JSON → 进同一套纯函数
 // ============================================================
 
@@ -1063,19 +1084,19 @@ function extractCodexFromConfigText(
 }
 
 function loadClaudeConfig(): ClaudeConfig | undefined {
-	const settingsPath = join(homedir(), ".claude", "settings.json");
+	const settingsPath = ccSwitchCliPaths().claudeSettingsPath;
 	if (!existsSync(settingsPath)) {
-		loadDiagnostics.claude = `Claude: ~/.claude/settings.json not found, skip provider registration`;
+		loadDiagnostics.claude = `Claude: settings file not found at ${settingsPath}; skip provider registration`;
 		return undefined;
 	}
 	const settings = readJsonObject(settingsPath);
 	if (!settings) {
-		loadDiagnostics.claude = `Claude: ~/.claude/settings.json is unreadable or not a JSON object`;
+		loadDiagnostics.claude = `Claude: settings file is unreadable or not a JSON object: ${settingsPath}`;
 		return undefined;
 	}
 	const env = isRecord(settings.env) ? settings.env : undefined;
 	if (!env) {
-		loadDiagnostics.claude = `Claude: ~/.claude/settings.json missing 'env' object`;
+		loadDiagnostics.claude = `Claude: settings file missing 'env' object: ${settingsPath}`;
 		return undefined;
 	}
 	const result = extractClaudeFromSettings(settings, env);
@@ -1083,11 +1104,12 @@ function loadClaudeConfig(): ClaudeConfig | undefined {
 		loadDiagnostics.claude = `Claude: ${result.error}`;
 		return undefined;
 	}
+	loadDiagnostics.claude = undefined;
 	return result.config;
 }
 
 /**
- * 极简 section-aware TOML 解析器，专为 cc-switch 写出来的 ~/.codex/config.toml 设计。
+ * 极简 section-aware TOML 解析器，专为 cc-switch 写出的活动 Codex config.toml 设计。
  *
  * 仅覆盖 cc-switch 实际产物的语法子集：
  *   - key = "value" / 'value'（含基本反斜杠转义）
@@ -1227,7 +1249,7 @@ function sanitizeFooterStatusText(text: string): string {
  */
 function installCcSwitchFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
-	const configPath = join(homedir(), ".codex", "config.toml");
+	const configPath = ccSwitchCliPaths().codexConfigPath;
 
 	ctx.ui.setFooter((tui, theme, footerData) => {
 		let codexConfig = readCodexFooterConfig(configPath);
@@ -1479,21 +1501,22 @@ function codexSummaryRouteStatus(codex: CodexConfig): string {
 }
 
 function loadCodexConfig(): CodexConfig | undefined {
-	const authPath = join(homedir(), ".codex", "auth.json");
-	const configPath = join(homedir(), ".codex", "config.toml");
+	const paths = ccSwitchCliPaths();
+	const authPath = paths.codexAuthPath;
+	const configPath = paths.codexConfigPath;
 
 	if (!existsSync(authPath)) {
-		loadDiagnostics.codex = `Codex: ~/.codex/auth.json not found, skip provider registration`;
+		loadDiagnostics.codex = `Codex: auth.json not found at ${authPath}; skip provider registration`;
 		return undefined;
 	}
 	const auth = readJsonObject(authPath);
 	const apiKey = stringValue(auth?.OPENAI_API_KEY);
 	if (!apiKey) {
-		loadDiagnostics.codex = `Codex: ~/.codex/auth.json missing OPENAI_API_KEY`;
+		loadDiagnostics.codex = `Codex: auth.json missing OPENAI_API_KEY: ${authPath}`;
 		return undefined;
 	}
 	if (!existsSync(configPath)) {
-		loadDiagnostics.codex = `Codex: ~/.codex/config.toml not found`;
+		loadDiagnostics.codex = `Codex: config.toml not found at ${configPath}`;
 		return undefined;
 	}
 
@@ -1501,15 +1524,16 @@ function loadCodexConfig(): CodexConfig | undefined {
 	try {
 		configText = readFileSync(configPath, "utf8");
 	} catch (error) {
-		loadDiagnostics.codex = `Codex: cannot read config.toml: ${(error as Error).message}`;
+		loadDiagnostics.codex = `Codex: cannot read ${configPath}: ${(error as Error).message}`;
 		return undefined;
 	}
 
 	const result = extractCodexFromConfigText(apiKey, configText, dirname(configPath));
 	if (!result.ok) {
-		loadDiagnostics.codex = `Codex: ${result.error} in config.toml`;
+		loadDiagnostics.codex = `Codex: ${result.error} in ${configPath}`;
 		return undefined;
 	}
+	loadDiagnostics.codex = undefined;
 	return result.config;
 }
 
@@ -1565,7 +1589,7 @@ function resolveRuntimeClaudeModel(model: Model<Api>, liveConfig?: ClaudeConfig)
 		return model;
 	}
 	if (!liveConfig?.currentModel) {
-		throw new Error("cc-switch Claude current model is not set in ~/.claude/settings.json");
+		throw new Error("cc-switch Claude current model is not set in the configured Claude settings file");
 	}
 	const currentModel = liveConfig.currentModel;
 	return {
@@ -2096,6 +2120,22 @@ function effortForReasoning(reasoning: SimpleStreamOptions["reasoning"]): string
 	return undefined;
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * 每次请求都换 session id 会让号池型中转反复重新分配账号，也拿不到中转侧的会话缓存。
+ * 官方 CLI 是整个会话复用同一个 UUID，这里跟随 Pi 的 sessionId；
+ * Pi 的 ID 不是 UUID 格式时做一次稳定哈希，保持中转期望的形状且同会话恒定。
+ */
+function claudeSessionId(options?: SimpleStreamOptions): string {
+	const piSessionId = stringValue(options?.sessionId);
+	if (!piSessionId) return randomUUID();
+	if (UUID_PATTERN.test(piSessionId)) return piSessionId;
+
+	const hex = createHash("sha256").update(`pi-cc-switch-claude:${piSessionId}`).digest("hex");
+	return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20, 32)].join("-");
+}
+
 function buildAnthropicPayload(
 	model: Model<Api>,
 	context: Context,
@@ -2142,12 +2182,12 @@ function buildAnthropicPayload(
 			const effort = effortForReasoning(reasoning);
 			if (effort) payload.output_config = { effort };
 		}
+		// user_id 只发单个稳定哈希，不要拼成 Claude Code 的完整身份信封。
+		// 实测（2026-07-26，i.wqwlkj.cn）：user_id 里同时出现 device_id + account_uuid + session_id
+		// 三元组时，中转判定为非 CC 客户端伪造身份，稳定返回 429「Upstream rate limit exceeded」——
+		// 池子健康时对照 0/5 vs 5/5，与 device_id 取值、JSON 形状、长度、单个关键词都无关。
 		payload.metadata = {
-			user_id: JSON.stringify({
-				device_id: createHash("sha256").update(`${homedir()}:pi-cc-switch-provider`).digest("hex"),
-				account_uuid: "",
-				session_id: sessionId,
-			}),
+			user_id: createHash("sha256").update(`${homedir()}:pi-cc-switch-provider`).digest("hex"),
 		};
 	} else {
 		const budget = thinkingBudget(reasoning, options);
@@ -2975,7 +3015,7 @@ function streamCcSwitchAnthropic(
 			const apiKey = liveClaude?.apiKey ?? options?.apiKey;
 			if (!apiKey) throw new Error("Missing cc-switch Claude credential");
 
-			const sessionId = randomUUID();
+			const sessionId = claudeSessionId(options);
 			const headers: Record<string, string> = {
 				accept: "application/json",
 				"content-type": "application/json",
@@ -3094,6 +3134,8 @@ function streamCcSwitchAnthropic(
 }
 
 export default function (pi: ExtensionAPI) {
+	// Re-evaluate device-local directory overrides for every extension load/reload.
+	activeCcSwitchCliPaths = resolveCcSwitchCliPaths(homedir());
 	const claude = loadClaudeConfig();
 	if (claude) {
 		pi.registerProvider("cc-switch-claude", {
@@ -3164,10 +3206,10 @@ export default function (pi: ExtensionAPI) {
 			const lines = [
 				liveClaude
 					? `Claude: current=${liveClaude.currentModel ?? "unknown"}; models=${liveClaude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${liveClaude.baseUrl}`
-					: loadDiagnostics.claude ?? "Claude: no ~/.claude/settings.json provider found",
+					: loadDiagnostics.claude ?? "Claude: no configured settings provider found",
 				liveCodex
 					? `Codex: cc-switch-codex/${liveCodex.model} -> ${liveCodex.baseUrl}; catalog=${liveCodex.catalogStatus === "loaded" ? `cc-switch/${liveCodex.catalogModels.length}` : `fallback/${liveCodex.catalogStatus}`}`
-					: loadDiagnostics.codex ?? "Codex: no ~/.codex provider found",
+					: loadDiagnostics.codex ?? "Codex: no configured provider found",
 				liveCodex ? codexSummaryRouteStatus(liveCodex) : "Codex Summary: unavailable",
 				fcappKeepwarmStatusLine(),
 			];
