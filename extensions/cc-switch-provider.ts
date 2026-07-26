@@ -24,11 +24,6 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import {
-	type CodexSummaryRoute,
-	isCodexSummaryCredentialUnavailableError,
-	resolveCodexSummaryRoute,
-} from "../lib/codex-summary-route.ts";
 
 type AuthKind = "api-key" | "bearer";
 
@@ -40,14 +35,25 @@ interface ClaudeConfig {
 	currentModel?: string;
 }
 
-type ClaudeSummaryFallbackConfig = ClaudeConfig & { currentModel: string };
-
 interface CodexConfig {
 	baseUrl: string;
 	apiKey: string;
 	api: "cc-switch-codex-responses" | "openai-completions";
 	model: string;
 	modelReasoningEffort?: string;
+}
+
+interface CcSwitchProviderLocalConfig {
+	codexSummary?: {
+		baseUrl?: string;
+	};
+}
+
+interface CodexSummaryRoute {
+	baseUrl: string;
+	apiKey: string;
+	model: string;
+	source: "env" | "config" | "default";
 }
 
 interface SseEvent {
@@ -67,19 +73,13 @@ type StreamBlock =
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
-// Codex metadata declares 272K; native Codex applies a 5% safety margin and reports 258,400 usable tokens.
-const DEFAULT_CODEX_CONTEXT_WINDOW = 272000;
+const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
 const CODEX_CONTEXT_WINDOW_ENV = "PI_CC_SWITCH_CODEX_CONTEXT_WINDOW";
-const DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO = 0.85;
-const CC_SWITCH_EARLY_COMPACTION_ENV = "PI_CC_SWITCH_EARLY_COMPACTION";
-const CC_SWITCH_COMPACTION_AUTO_RESUME_ENV = "PI_CC_SWITCH_COMPACTION_AUTO_RESUME";
-const CODEX_SUMMARY_CLAUDE_FALLBACK_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK";
-const CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_RATIO";
-const CC_SWITCH_COMPACTION_TRIGGER_TOKENS_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS";
-const CC_SWITCH_COMPACTION_STATUS_KEY = "cc-switch-compaction";
-const CC_SWITCH_COMPACTION_CONTINUATION_TYPE = "cc-switch-compaction-continuation";
-const CC_SWITCH_COMPACTION_CONTINUATION_PROMPT =
-	"Automatic context compaction interrupted an unfinished tool-use turn. Continue the user's current task from the compaction summary and retained messages. Do not ask the user to repeat the request or redo completed work; inspect the current state and proceed with the next unfinished step.";
+const CODEX_SUMMARY_BASE_URL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL";
+const DEFAULT_CODEX_SUMMARY_BASE_URL = "https://paid.tribiosapi.top/v1";
+const CC_SWITCH_PROVIDER_CONFIG_FILE = "cc-switch-provider.json";
+const CODEX_SUMMARY_MODEL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_MODEL";
+const CODEX_SUMMARY_API_KEY_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_API_KEY";
 const CURRENT_CODEX_MODEL_ID = "current";
 const DEFAULT_CODEX_MODELS = ["gpt-5.5", "gpt-5.6-sol"] as const;
 const CODEX_CONFIG_REASONING_MODEL = "gpt-5.6-sol";
@@ -166,10 +166,8 @@ const loadDiagnostics: { claude?: string; codex?: string } = {};
 
 // 中转网关上下文溢出文案归一化模式。pi 只识别少数标准文案才会触发自动 compact 重试，
 // 这里把常见几类映射成 "context_length_exceeded"。负向列表避免误把限流/配额当成溢出。
-const CONTEXT_OVERFLOW_CODE_PATTERN = /context[_ -]*(?:length|window)[_ -]*(?:exceeded|overflow)|input[_ -]*too[_ -]*long/i;
-const CONTEXT_OVERFLOW_PATTERNS = [
-	CONTEXT_OVERFLOW_CODE_PATTERN,
-	/prompt (?:is )?too long/i,
+const CLAUDE_OVERFLOW_PATTERNS = [
+	/prompt is too long/i,
 	/input length .{0,40}exceeds? .{0,40}(context|token)/i,
 	/exceeds? .{0,40}(context|token) (length|window|limit)/i,
 	/context (length|window) exceeded/i,
@@ -179,25 +177,13 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 	/上下文.{0,4}(过长|超出|超过)/,
 	/超出.{0,4}(上下文|长度限制)/,
 ];
-const CONTEXT_OVERFLOW_NEGATIVE_PATTERNS = [
+const CLAUDE_OVERFLOW_NEGATIVE_PATTERNS = [
 	/rate limit/i,
 	/too many requests/i,
 	/quota/i,
 	/insufficient (balance|credit|funds|quota)/i,
 	/payment required/i,
 ];
-
-function normalizeContextOverflowMessage(text: string): string | undefined {
-	if (!text) return undefined;
-	const hasExplicitOverflowCode = CONTEXT_OVERFLOW_CODE_PATTERN.test(text);
-	if (!hasExplicitOverflowCode && CONTEXT_OVERFLOW_NEGATIVE_PATTERNS.some((pattern) => pattern.test(text))) return undefined;
-	if (!CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text))) return undefined;
-
-	const normalized = text.trimStart();
-	return /^context_length_exceeded/i.test(normalized)
-		? normalized.replace(/^context_length_exceeded/i, "context_length_exceeded")
-		: `context_length_exceeded: ${text}`;
-}
 
 /**
  * 安全读取 JSON 对象：文件不存在、解析失败、根节点非对象都返回 undefined。
@@ -230,42 +216,6 @@ function positiveIntegerEnv(name: string): number | undefined {
 	if (Number.isFinite(value) && value > 0) return value;
 	console.warn(`[cc-switch] Ignore invalid ${name}=${raw}; expected a positive integer`);
 	return undefined;
-}
-
-function enabledByDefaultEnv(name: string): boolean {
-	const raw = process.env[name]?.trim();
-	if (!raw) return true;
-	return !/^(0|false|no|off)$/i.test(raw);
-}
-
-function ccSwitchEarlyCompactionEnabled(): boolean {
-	return enabledByDefaultEnv(CC_SWITCH_EARLY_COMPACTION_ENV);
-}
-
-function ccSwitchCompactionAutoResumeEnabled(): boolean {
-	return enabledByDefaultEnv(CC_SWITCH_COMPACTION_AUTO_RESUME_ENV);
-}
-
-function codexSummaryClaudeFallbackEnabled(): boolean {
-	return enabledByDefaultEnv(CODEX_SUMMARY_CLAUDE_FALLBACK_ENV);
-}
-
-function ccSwitchCompactionTriggerTokens(contextWindow: number): number {
-	const explicitTokens = positiveIntegerEnv(CC_SWITCH_COMPACTION_TRIGGER_TOKENS_ENV);
-	if (explicitTokens !== undefined) {
-		return Math.min(explicitTokens, Math.max(1, contextWindow - 1));
-	}
-
-	const rawRatio = process.env[CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV]?.trim();
-	if (rawRatio) {
-		const ratio = Number(rawRatio);
-		if (Number.isFinite(ratio) && ratio > 0 && ratio < 1) {
-			return Math.max(1, Math.floor(contextWindow * ratio));
-		}
-		console.warn(`[cc-switch] Ignore invalid ${CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV}=${rawRatio}; expected a number between 0 and 1`);
-	}
-
-	return Math.max(1, Math.floor(contextWindow * DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO));
 }
 
 function isFcappAdmissionRetryEndpoint(url: string): boolean {
@@ -399,7 +349,9 @@ function fcappKeepwarmProcessState(): FcappKeepwarmProcessState {
 }
 
 function fcappKeepwarmEnabledFromEnv(): boolean {
-	return enabledByDefaultEnv(FCAPP_KEEPWARM_ENABLED_ENV);
+	const raw = process.env[FCAPP_KEEPWARM_ENABLED_ENV]?.trim();
+	if (!raw) return true;
+	return !/^(0|false|no|off)$/i.test(raw);
 }
 
 function fcappKeepwarmEnabled(): boolean {
@@ -881,9 +833,10 @@ function uniqueStrings(values: string[]): string[] {
 // ============================================================
 // 数据提取层（纯函数）
 //
-// 把“从 live settings/config 提取 Claude/Codex 配置”剥离成纯函数。
-// 凭据只来自 cc-switch 写入的 live 文件或 Pi runtime；独立摘要路由由
-// codex-summary-route.ts 通过显式 authRef 解析，绝不读取 cc-switch.db。
+// 把"从 env / settings_config 对象提取 Claude/Codex 配置"剥离成纯函数，
+// 让两条数据源共享同一套提取逻辑：
+//   - live-file 路径：读 ~/.claude/settings.json / ~/.codex/* → 进对应纯函数
+//   - SQLite 路径：读 ~/.cc-switch/cc-switch.db 的 settings_config JSON → 进同一套纯函数
 // ============================================================
 
 type ExtractResult<T> = { ok: true; config: T } | { ok: false; error: string };
@@ -1231,13 +1184,12 @@ function installCcSwitchFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 				}
 
 				const model = ctx.model;
-				const followsLiveCodex = model?.provider === "cc-switch-codex" && isCurrentCodexModel(model.id) &&
+				const followsLiveCodex = model?.provider === "cc-switch-codex" &&
 					codexConfig.api === "cc-switch-codex-responses" && Boolean(codexConfig.model);
 				const modelName = followsLiveCodex ? (codexConfig.model as string) : (model?.id ?? "no-model");
 				let rightSideWithoutProvider = modelName;
 				if (model?.reasoning) {
-					const configuredEffort = model?.provider === "cc-switch-codex" &&
-						modelName === CODEX_CONFIG_REASONING_MODEL
+					const configuredEffort = followsLiveCodex && modelName === CODEX_CONFIG_REASONING_MODEL
 						? codexConfig.modelReasoningEffort
 						: undefined;
 					const thinkingLevel = pi.getThinkingLevel() || "off";
@@ -1288,44 +1240,114 @@ function installCcSwitchFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	});
 }
 
-function codexSummaryClaudeFallbackConfig(): ClaudeSummaryFallbackConfig | undefined {
-	if (!codexSummaryClaudeFallbackEnabled()) return undefined;
-	const liveClaude = loadClaudeConfig();
-	if (!liveClaude?.currentModel || !supportsOneMillionContext(liveClaude.currentModel)) return undefined;
-	return { ...liveClaude, currentModel: liveClaude.currentModel };
+function extractCodexBaseUrlFromConfigText(configText: string): string | undefined {
+	const toml = parseCodexConfigToml(configText);
+	const activeProviderId = toml.top.model_provider;
+	const section = activeProviderId
+		? toml.sections[`model_providers.${activeProviderId}`]
+		: undefined;
+	return section?.base_url ?? toml.top.base_url;
 }
 
-function codexSummaryClaudeFallbackModel(claude: ClaudeSummaryFallbackConfig): Model<Api> {
-	const displayModel = claude.currentModel;
+function normalizeUrlForCompare(value: string): string {
+	return value.replace(/\/+$/, "").toLowerCase();
+}
+
+function readCcSwitchDbText(): string | undefined {
+	const dbPath = join(homedir(), ".cc-switch", "cc-switch.db");
+	if (!existsSync(dbPath)) return undefined;
+	try {
+		return readFileSync(dbPath).toString("utf8");
+	} catch {
+		return undefined;
+	}
+}
+
+function decodeCcSwitchConfigText(raw: string): string {
+	return raw
+		.replace(/\\n/g, "\n")
+		.replace(/\\r/g, "\r")
+		.replace(/\\t/g, "\t")
+		.replace(/\\"/g, '"')
+		.replace(/\\\\/g, "\\");
+}
+
+function findCodexProviderInCcSwitchDb(baseUrl: string): { apiKey?: string; model?: string } | undefined {
+	const dbText = readCcSwitchDbText();
+	if (!dbText) return undefined;
+	const target = normalizeUrlForCompare(baseUrl);
+	const pattern = /\{"auth":\{"OPENAI_API_KEY":"([^"]+)"\},"config":"([\s\S]{0,4000}?)"\}https?:\/\//g;
+	let match: RegExpExecArray | null;
+	while ((match = pattern.exec(dbText)) !== null) {
+		const configText = decodeCcSwitchConfigText(match[2]);
+		const configBaseUrl = extractCodexBaseUrlFromConfigText(configText);
+		if (!configBaseUrl || normalizeUrlForCompare(configBaseUrl) !== target) continue;
+		const parsed = parseCodexConfigToml(configText);
+		return {
+			apiKey: match[1],
+			model: parsed.top.model,
+		};
+	}
+	return undefined;
+}
+
+function ccSwitchProviderConfigPath(): string {
+	return join(homedir(), ".pi", "agent", CC_SWITCH_PROVIDER_CONFIG_FILE);
+}
+
+function loadCcSwitchProviderLocalConfig(): CcSwitchProviderLocalConfig | undefined {
+	const configPath = ccSwitchProviderConfigPath();
+	if (!existsSync(configPath)) return undefined;
+	const config = readJsonObject(configPath);
+	if (!config) {
+		throw new Error(`独立压缩中转配置文件不是有效的 JSON 对象：${configPath}`);
+	}
+	if (config.codexSummary !== undefined && !isRecord(config.codexSummary)) {
+		throw new Error(`独立压缩中转配置 codexSummary 必须是 JSON 对象：${configPath}`);
+	}
+	const codexSummary = isRecord(config.codexSummary) ? config.codexSummary : undefined;
 	return {
-		id: CURRENT_CLAUDE_MODEL_ID,
-		name: `cc-switch Claude summary fallback (${displayModel})`,
-		api: "cc-switch-anthropic" as Api,
-		provider: "cc-switch-claude",
-		baseUrl: claude.baseUrl,
-		reasoning: true,
-		thinkingLevelMap: { xhigh: "xhigh" },
-		input: TEXT_IMAGE_INPUT,
-		cost: ZERO_COST,
-		contextWindow: claudeContextWindow(displayModel),
-		maxTokens: 64000,
+		codexSummary: codexSummary
+			? { baseUrl: stringValue(codexSummary.baseUrl) }
+			: undefined,
 	};
 }
 
-function streamCodexSummaryViaClaude(
-	context: Context,
-	options: SimpleStreamOptions | undefined,
-	reason: string,
-): AssistantMessageEventStream | undefined {
-	const claude = codexSummaryClaudeFallbackConfig();
-	if (!claude) return undefined;
-	console.warn(`[cc-switch] Codex summary is using the configured 1M Claude route: ${reason}`);
-	return streamCcSwitchAnthropic(
-		claude.authKind,
-		codexSummaryClaudeFallbackModel(claude),
-		context,
-		options,
-	);
+function validateCodexSummaryBaseUrl(baseUrl: string): string {
+	try {
+		const parsed = new URL(baseUrl);
+		if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("unsupported protocol");
+		return baseUrl;
+	} catch {
+		throw new Error(`独立压缩中转 baseUrl 必须是有效的 HTTP/HTTPS 地址：${baseUrl}`);
+	}
+}
+
+function codexSummaryBaseUrlConfig(): Pick<CodexSummaryRoute, "baseUrl" | "source"> {
+	const envBaseUrl = process.env[CODEX_SUMMARY_BASE_URL_ENV]?.trim();
+	if (envBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(envBaseUrl), source: "env" };
+
+	const fileBaseUrl = loadCcSwitchProviderLocalConfig()?.codexSummary?.baseUrl;
+	if (fileBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(fileBaseUrl), source: "config" };
+
+	return { baseUrl: DEFAULT_CODEX_SUMMARY_BASE_URL, source: "default" };
+}
+
+function resolveIndependentCodexSummaryRoute(): CodexSummaryRoute {
+	const { baseUrl, source } = codexSummaryBaseUrlConfig();
+	if (isFcappAdmissionRetryEndpoint(baseUrl)) {
+		throw new Error(`独立压缩中转不能指向不支持压缩的 FC 地址：${baseUrl}`);
+	}
+
+	const provider = findCodexProviderInCcSwitchDb(baseUrl);
+	const model = process.env[CODEX_SUMMARY_MODEL_ENV]?.trim() || provider?.model;
+	const apiKey = process.env[CODEX_SUMMARY_API_KEY_ENV]?.trim() || provider?.apiKey;
+	if (!model || !apiKey) {
+		throw new Error(
+			`未找到独立压缩中转配置：${baseUrl}。请在 cc-switch 中添加 base_url 完全相同且包含模型和 API Key 的 Codex Provider，或设置 ${CODEX_SUMMARY_MODEL_ENV} 与 ${CODEX_SUMMARY_API_KEY_ENV}。`,
+		);
+	}
+	return { baseUrl, apiKey, model, source };
 }
 
 function codexSummaryRouteStatus(codex: CodexConfig): string {
@@ -1333,23 +1355,10 @@ function codexSummaryRouteStatus(codex: CodexConfig): string {
 		return `Codex Summary: 跟随当前中转 ${codex.baseUrl}`;
 	}
 	try {
-		const route = resolveCodexSummaryRoute({ liveModel: codex.model });
-		if (!route) {
-			const fallback = codexSummaryClaudeFallbackConfig();
-			return fallback
-				? `Codex Summary: 回退 cc-switch-claude/${fallback.currentModel} -> ${fallback.baseUrl} [1M Claude]`
-				: "Codex Summary: 跟随当前中转（未配置独立路由）";
-		}
-		const sourceLabel = route.configSource === "environment" ? "环境变量配置" : "本地引用配置";
-		const authLabel = route.authSource === "cc-switch-proxy" ? "CC Switch 代理认证" : "进程环境认证";
-		return `Codex Summary: ${route.model} -> ${route.baseUrl} [FC 独立压缩/${sourceLabel}/${authLabel}]`;
+		const route = resolveIndependentCodexSummaryRoute();
+		const sourceLabel = route.source === "env" ? "环境变量" : route.source === "config" ? "配置文件" : "默认配置";
+		return `Codex Summary: ${route.model} -> ${route.baseUrl} [FC 独立压缩/${sourceLabel}]`;
 	} catch (error) {
-		if (isCodexSummaryCredentialUnavailableError(error)) {
-			const fallback = codexSummaryClaudeFallbackConfig();
-			if (fallback) {
-				return `Codex Summary: 独立路由缺少凭据；回退 cc-switch-claude/${fallback.currentModel} -> ${fallback.baseUrl} [1M Claude]`;
-			}
-		}
 		return `Codex Summary: 配置错误 ${error instanceof Error ? error.message : String(error)}`;
 	}
 }
@@ -1436,23 +1445,6 @@ function isCurrentCodexModel(modelId: string): boolean {
 	return modelId === CURRENT_CODEX_MODEL_ID;
 }
 
-function isCcSwitchProvider(provider: string | undefined): boolean {
-	return provider === "cc-switch-codex" || provider === "cc-switch-claude";
-}
-
-function ccSwitchRuntimeContextWindow(
-	provider: string | undefined,
-	modelId: string | undefined,
-	fallback: number | undefined,
-): number | undefined {
-	if (provider === "cc-switch-codex") return codexContextWindow();
-	if (provider === "cc-switch-claude" && modelId === CURRENT_CLAUDE_MODEL_ID) {
-		const liveModel = loadClaudeConfig()?.currentModel;
-		if (liveModel) return claudeContextWindow(liveModel);
-	}
-	return fallback;
-}
-
 function resolveRuntimeClaudeModel(model: Model<Api>, liveConfig?: ClaudeConfig): Model<Api> {
 	if (!isCurrentClaudeModel(model.id)) {
 		return model;
@@ -1475,15 +1467,10 @@ function resolveRuntimeCodexModel(model: Model<Api>, liveConfig?: CodexConfig): 
 	if (!liveConfig || liveConfig.api !== "cc-switch-codex-responses") {
 		return model;
 	}
-
-	// Only the `current` alias follows cc-switch's live model. Concrete model
-	// entries must remain concrete; otherwise Pi's model identity no longer
-	// matches the assistant messages and overflow recovery is skipped.
-	const followsLiveModel = isCurrentCodexModel(model.id);
 	return {
 		...model,
-		id: followsLiveModel ? liveConfig.model : model.id,
-		name: followsLiveModel ? `cc-switch Codex (${liveConfig.model})` : model.name,
+		id: liveConfig.model,
+		name: `cc-switch Codex (${liveConfig.model})`,
 		baseUrl: liveConfig.baseUrl,
 		input: TEXT_IMAGE_INPUT,
 		contextWindow: codexContextWindow(),
@@ -2671,8 +2658,6 @@ function handleResponsesEvent(
 			rawEvent: event,
 			timestamp: new Date().toISOString()
 		}, null, 2));
-		const normalizedOverflow = normalizeContextOverflowMessage(`${errorCode}: ${errorMsg}`);
-		if (normalizedOverflow) throw new Error(normalizedOverflow);
 		throw new Error(`cc-switch Codex error: ${errorCode}: ${errorMsg}`);
 	}
 
@@ -2689,8 +2674,10 @@ function handleResponsesEvent(
 			rawEvent: event,
 			timestamp: new Date().toISOString()
 		}, null, 2));
-		const normalizedOverflow = normalizeContextOverflowMessage(`${errorCode}: ${errorMsg}`);
-		if (normalizedOverflow) throw new Error(normalizedOverflow);
+		// 上下文溢出错误需要以 context_length_exceeded 开头，让 pi 自动 compact 重试
+		if (errorCode === "context_length_exceeded" || CLAUDE_OVERFLOW_PATTERNS.some((p) => p.test(errorMsg))) {
+			throw new Error(`context_length_exceeded: ${errorMsg}`);
+		}
 		throw new Error(`cc-switch Codex error: ${errorCode}: ${errorMsg}`);
 	}
 }
@@ -2743,11 +2730,7 @@ function streamCcSwitchCodexResponses(
 			content: [],
 			api: runtimeModel.api,
 			provider: runtimeModel.provider,
-			// Keep the selected registry ID in the session. The actual request
-			// model may be resolved from the `current` alias at runtime, but Pi
-			// uses this field to decide whether overflow recovery belongs to the
-			// active model.
-			model: model.id,
+			model: runtimeModel.id,
 			usage: {
 				input: 0,
 				output: 0,
@@ -2765,31 +2748,7 @@ function streamCcSwitchCodexResponses(
 			if (!apiKey) throw new Error("Missing cc-switch Codex credential");
 
 			const useIndependentSummaryRoute = isSummarizationContext(context) && isFcappAdmissionRetryEndpoint(runtimeModel.baseUrl);
-			let summaryRoute: CodexSummaryRoute | undefined;
-			if (useIndependentSummaryRoute) {
-				try {
-					summaryRoute = resolveCodexSummaryRoute({ liveModel: runtimeModel.id });
-				} catch (error) {
-					if (isCodexSummaryCredentialUnavailableError(error)) {
-						const fallback = streamCodexSummaryViaClaude(context, options, "independent Codex route has no credential");
-						if (fallback) {
-							for await (const event of fallback) stream.push(event);
-							stream.end();
-							return;
-						}
-					}
-					throw error;
-				}
-
-				if (!summaryRoute) {
-					const fallback = streamCodexSummaryViaClaude(context, options, "independent Codex route is not configured");
-					if (fallback) {
-						for await (const event of fallback) stream.push(event);
-						stream.end();
-						return;
-					}
-				}
-			}
+			const summaryRoute = useIndependentSummaryRoute ? resolveIndependentCodexSummaryRoute() : undefined;
 			const requestBaseUrl = summaryRoute?.baseUrl ?? runtimeModel.baseUrl;
 			const requestApiKey = summaryRoute?.apiKey ?? apiKey;
 			const requestModelId = summaryRoute?.model ?? runtimeModel.id;
@@ -2814,8 +2773,7 @@ function streamCcSwitchCodexResponses(
 			if (!response.ok) {
 				const errorText = await response.text();
 				const requestKind = summaryRoute ? "summary request" : "request";
-				const normalizedOverflow = normalizeContextOverflowMessage(errorText);
-				throw new Error(normalizedOverflow ?? `cc-switch Codex ${requestKind} failed: ${response.status} ${errorText} (${endpoint})`);
+				throw new Error(`cc-switch Codex ${requestKind} failed: ${response.status} ${errorText} (${endpoint})`);
 			}
 			if (!response.body) {
 				throw new Error(`cc-switch Codex${summaryRoute ? " summary" : ""} response did not include a stream body`);
@@ -2832,7 +2790,6 @@ function streamCcSwitchCodexResponses(
 			const errorDetails = {
 				provider: 'cc-switch-codex',
 				model: runtimeModel.id,
-				selectedModel: model.id,
 				api: runtimeModel.api,
 				error: error instanceof Error ? {
 					message: error.message,
@@ -2857,16 +2814,6 @@ function streamCcSwitchCodexResponses(
 	return stream;
 }
 
-function throwClaudeSseError(data: string): never {
-	console.error('[cc-switch Claude Error]', JSON.stringify({
-		type: 'sse_error',
-		data,
-		timestamp: new Date().toISOString()
-	}, null, 2));
-	const normalizedOverflow = normalizeContextOverflowMessage(data);
-	throw new Error(normalizedOverflow ?? `cc-switch Claude error: ${data}`);
-}
-
 function streamCcSwitchAnthropic(
 	authKind: AuthKind,
 	model: Model<Api>,
@@ -2874,7 +2821,6 @@ function streamCcSwitchAnthropic(
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
-	let runtimeModel = model;
 
 	(async () => {
 		const output: AssistantMessage = {
@@ -2882,9 +2828,6 @@ function streamCcSwitchAnthropic(
 			content: [],
 			api: model.api,
 			provider: model.provider,
-			// Keep the selected registry ID in the session. For `current`, the
-			// request ID is resolved dynamically but Pi's overflow guard compares
-			// the persisted message model with the selected registry model.
 			model: model.id,
 			usage: {
 				input: 0,
@@ -2900,7 +2843,8 @@ function streamCcSwitchAnthropic(
 
 		try {
 			const liveClaude = loadClaudeConfig();
-			runtimeModel = resolveRuntimeClaudeModel(model, liveClaude);
+			const runtimeModel = resolveRuntimeClaudeModel(model, liveClaude);
+			output.model = runtimeModel.id;
 			const apiKey = liveClaude?.apiKey ?? options?.apiKey;
 			if (!apiKey) throw new Error("Missing cc-switch Claude credential");
 
@@ -2945,9 +2889,7 @@ function streamCcSwitchAnthropic(
 			}, "Claude");
 
 			if (!response.ok) {
-				const errorText = await response.text();
-				const normalizedOverflow = normalizeContextOverflowMessage(errorText);
-				throw new Error(normalizedOverflow ?? `cc-switch Claude request failed: ${response.status} ${errorText}`);
+				throw new Error(`cc-switch Claude request failed: ${response.status} ${await response.text()}`);
 			}
 			if (!response.body) {
 				throw new Error("cc-switch Claude response did not include a stream body");
@@ -2966,7 +2908,20 @@ function streamCcSwitchAnthropic(
 				const parsed = parseSseChunk(buffer);
 				buffer = parsed.rest;
 				for (const sse of parsed.events) {
-					if (sse.event === "error") throwClaudeSseError(sse.data);
+					if (sse.event === "error") {
+						// 记录详细的错误日志，方便调试
+						console.error('[cc-switch Claude Error]', JSON.stringify({
+							type: 'sse_error',
+							event: sse.event,
+							data: sse.data,
+							timestamp: new Date().toISOString()
+						}, null, 2));
+						// 上下文溢出错误需要以 context_length_exceeded 开头，让 pi 自动 compact 重试
+						if (CLAUDE_OVERFLOW_PATTERNS.some((p) => p.test(sse.data))) {
+							throw new Error(`context_length_exceeded: ${sse.data}`);
+						}
+						throw new Error(`cc-switch Claude error: ${sse.data}`);
+					}
 					const event = JSON.parse(sse.data) as unknown;
 					if (isRecord(event)) handleAnthropicEvent(event, output, stream, runtimeModel);
 				}
@@ -2974,7 +2929,6 @@ function streamCcSwitchAnthropic(
 
 			const finalParsed = parseSseChunk(buffer + decoder.decode());
 			for (const sse of finalParsed.events) {
-				if (sse.event === "error") throwClaudeSseError(sse.data);
 				const event = JSON.parse(sse.data) as unknown;
 				if (isRecord(event)) handleAnthropicEvent(event, output, stream, runtimeModel);
 			}
@@ -2986,8 +2940,7 @@ function streamCcSwitchAnthropic(
 			// 记录详细的错误日志，方便调试
 			const errorDetails = {
 				provider: 'cc-switch-claude',
-				model: runtimeModel.id,
-				selectedModel: model.id,
+				model: output.model,
 				api: model.api,
 				error: error instanceof Error ? {
 					message: error.message,
@@ -3014,18 +2967,6 @@ function streamCcSwitchAnthropic(
 }
 
 export default function (pi: ExtensionAPI) {
-	let previousContextTokens: number | undefined;
-	let previousCompactionTriggerTokens: number | undefined;
-	let earlyCompactionRetryAtTokens: number | undefined;
-	let earlyCompactionInFlight = false;
-
-	const resetEarlyCompactionState = () => {
-		previousContextTokens = undefined;
-		previousCompactionTriggerTokens = undefined;
-		earlyCompactionRetryAtTokens = undefined;
-		earlyCompactionInFlight = false;
-	};
-
 	const claude = loadClaudeConfig();
 	if (claude) {
 		pi.registerProvider("cc-switch-claude", {
@@ -3089,20 +3030,6 @@ export default function (pi: ExtensionAPI) {
 		handler: (_args, ctx) => {
 			const liveClaude = loadClaudeConfig() ?? claude;
 			const liveCodex = loadCodexConfig() ?? codex;
-			const reportedContextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
-			const contextWindow = ccSwitchRuntimeContextWindow(ctx.model?.provider, ctx.model?.id, reportedContextWindow);
-			const providerUsesEarlyCompaction = isCcSwitchProvider(ctx.model?.provider);
-			const earlyCompactionEnabled = ccSwitchEarlyCompactionEnabled();
-			const triggerTokens = providerUsesEarlyCompaction && earlyCompactionEnabled && contextWindow
-				? ccSwitchCompactionTriggerTokens(contextWindow)
-				: undefined;
-			const compactionStatus = !providerUsesEarlyCompaction
-				? "Early Compaction: inactive for current provider"
-				: !earlyCompactionEnabled
-					? `Early Compaction: disabled by ${CC_SWITCH_EARLY_COMPACTION_ENV}`
-					: triggerTokens !== undefined && contextWindow
-						? `Early Compaction: ${formatFooterTokens(triggerTokens)}/${formatFooterTokens(contextWindow)} (${(triggerTokens / contextWindow * 100).toFixed(0)}%, turn boundary)`
-						: "Early Compaction: context usage unavailable";
 			const lines = [
 				liveClaude
 					? `Claude: current=${liveClaude.currentModel ?? "unknown"}; models=${liveClaude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${liveClaude.baseUrl}`
@@ -3111,7 +3038,6 @@ export default function (pi: ExtensionAPI) {
 					? `Codex: cc-switch-codex/${liveCodex.model} -> ${liveCodex.baseUrl}`
 					: loadDiagnostics.codex ?? "Codex: no ~/.codex provider found",
 				liveCodex ? codexSummaryRouteStatus(liveCodex) : "Codex Summary: unavailable",
-				compactionStatus,
 				fcappKeepwarmStatusLine(),
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
@@ -3155,129 +3081,12 @@ export default function (pi: ExtensionAPI) {
 		// 进程级 enabledOverride 不在此处重置，确保当前窗口执行 /fc off 后跨会话重载仍保持关闭。
 		cleanupFcappKeepwarmRuntime();
 		fcappKeepwarmStatusSink = undefined;
-		resetEarlyCompactionState();
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		resetEarlyCompactionState();
 		installCcSwitchFooter(pi, ctx);
 		fcappKeepwarmStatusSink = (text) => ctx.ui.setStatus(FCAPP_KEEPWARM_STATUS_KEY, text);
 		fcappKeepwarmStatusSink(fcappKeepwarmStatusText);
-		ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
-	});
-
-	pi.on("model_select", (_event, ctx) => {
-		resetEarlyCompactionState();
-		ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
-	});
-
-	pi.on("session_compact", (_event, ctx) => {
-		resetEarlyCompactionState();
-		ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
-	});
-
-	// Pi's built-in proactive compaction defaults to contextWindow - 16,384
-	// and is checked after the complete agent run. cc-switch sessions often have
-	// long tool chains, so trigger at a turn boundary as soon as the configured
-	// ratio is crossed. ctx.compact() aborts the pending continuation before it
-	// summarizes; a hidden follow-up resumes unfinished tool-use turns afterward.
-	pi.on("turn_end", (event, ctx) => {
-		if (!ccSwitchEarlyCompactionEnabled() || !isCcSwitchProvider(ctx.model?.provider)) {
-			previousContextTokens = undefined;
-			previousCompactionTriggerTokens = undefined;
-			earlyCompactionRetryAtTokens = undefined;
-			return;
-		}
-
-		const usage = ctx.getContextUsage();
-		const currentTokens = usage?.tokens;
-		const contextWindow = ccSwitchRuntimeContextWindow(
-			ctx.model?.provider,
-			ctx.model?.id,
-			usage?.contextWindow ?? ctx.model?.contextWindow,
-		) ?? 0;
-		if (currentTokens === null || currentTokens === undefined || contextWindow <= 0) {
-			previousContextTokens = undefined;
-			previousCompactionTriggerTokens = undefined;
-			earlyCompactionRetryAtTokens = undefined;
-			return;
-		}
-
-		const triggerTokens = ccSwitchCompactionTriggerTokens(contextWindow);
-		const triggerChanged = previousCompactionTriggerTokens !== undefined &&
-			previousCompactionTriggerTokens !== triggerTokens;
-		const crossedTrigger = currentTokens > triggerTokens && (
-			previousContextTokens === undefined ||
-			previousContextTokens <= triggerTokens ||
-			triggerChanged
-		);
-		const retryDue = earlyCompactionRetryAtTokens !== undefined && currentTokens >= earlyCompactionRetryAtTokens;
-		previousContextTokens = currentTokens;
-		previousCompactionTriggerTokens = triggerTokens;
-		if ((!crossedTrigger && !retryDue) || earlyCompactionInFlight) return;
-
-		// compact() aborts Pi's current run and clears its queued steer/follow-up
-		// messages. Defer one turn rather than discard a user's pending message.
-		if (ctx.hasPendingMessages()) {
-			previousContextTokens = triggerTokens;
-			return;
-		}
-
-		const resumeInterruptedToolTurn =
-			ccSwitchCompactionAutoResumeEnabled() && event.message.stopReason === "toolUse";
-		earlyCompactionRetryAtTokens = undefined;
-		earlyCompactionInFlight = true;
-		const status = `自动压缩: ${formatFooterTokens(currentTokens)} > ${formatFooterTokens(triggerTokens)}`;
-		ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, status);
-		if (ctx.hasUI) ctx.ui.notify(`${status}，正在生成摘要`, "info");
-		ctx.compact({
-			onComplete: (result) => {
-				// Suppress an immediate second compaction if keepRecentTokens leaves
-				// the rebuilt context above this extension's early threshold. A later
-				// below-to-above crossing or threshold change can trigger again.
-				previousContextTokens = Math.max(currentTokens, triggerTokens + 1);
-				previousCompactionTriggerTokens = triggerTokens;
-				earlyCompactionRetryAtTokens = undefined;
-				earlyCompactionInFlight = false;
-				ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
-
-				const canResume = resumeInterruptedToolTurn && !ctx.hasPendingMessages();
-				if (canResume) {
-					pi.sendMessage(
-						{
-							customType: CC_SWITCH_COMPACTION_CONTINUATION_TYPE,
-							content: CC_SWITCH_COMPACTION_CONTINUATION_PROMPT,
-							display: false,
-							details: {
-								reason: "early-compaction",
-								tokensBefore: result.tokensBefore,
-							},
-						},
-						{ triggerTurn: true, deliverAs: "followUp" },
-					);
-				}
-
-				if (ctx.hasUI) {
-					ctx.ui.notify(
-						canResume ? "上下文自动压缩完成，正在继续未完成的任务" : "上下文自动压缩完成",
-						"info",
-					);
-				}
-			},
-			onError: (error) => {
-				earlyCompactionInFlight = false;
-				// Retry only after another 5% of the window has accumulated. This
-				// avoids aborting every tool turn when a summary endpoint is down.
-				const retryStep = Math.max(1000, Math.floor(contextWindow * 0.05));
-				earlyCompactionRetryAtTokens = Math.min(
-					currentTokens + retryStep,
-					Math.max(currentTokens, contextWindow - 1000),
-				);
-				previousContextTokens = currentTokens;
-				ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
-				if (ctx.hasUI) ctx.ui.notify(`上下文自动压缩失败: ${error.message}`, "error");
-			},
-		});
 	});
 
 	pi.on("tool_execution_start", (event, ctx) => {
@@ -3313,16 +3122,18 @@ export default function (pi: ExtensionAPI) {
 		const message = event.message;
 		if (message.role !== "assistant") return;
 		if (message.stopReason !== "error") return;
-		if (!isCcSwitchProvider(message.provider)) return;
+		if (message.provider !== "cc-switch-claude" && message.provider !== "cc-switch-codex") return;
 
 		const errorMessage = message.errorMessage ?? "";
-		const normalizedOverflow = normalizeContextOverflowMessage(errorMessage);
-		if (!normalizedOverflow || normalizedOverflow === errorMessage) return;
+		if (!errorMessage) return;
+		if (errorMessage.includes("context_length_exceeded")) return; // 已是规范文案，幂等跳过
+		if (CLAUDE_OVERFLOW_NEGATIVE_PATTERNS.some((pattern) => pattern.test(errorMessage))) return;
+		if (!CLAUDE_OVERFLOW_PATTERNS.some((pattern) => pattern.test(errorMessage))) return;
 
 		return {
 			message: {
 				...message,
-				errorMessage: normalizedOverflow,
+				errorMessage: `context_length_exceeded: ${errorMessage}`,
 			},
 		};
 	});

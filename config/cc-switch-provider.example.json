@@ -1,7 +1,0 @@
-{
-  "$schema": "./cc-switch-provider.schema.json",
-  "codexSummary": {
-    "baseUrl": "http://127.0.0.1:15721/v1",
-    "authRef": "cc-switch-proxy"
-  }
-}

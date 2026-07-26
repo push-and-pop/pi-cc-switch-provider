@@ -212,7 +212,7 @@ To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claud
 
 ### Codex Models
 
-The extension registers `cc-switch-codex/current`, which re-reads `%USERPROFILE%\.codex\config.toml` before each request and follows the current model selected in cc-switch. It also registers the concrete current model plus fixed entries for `gpt-5.5` and `gpt-5.6-sol`. Only the `current` alias follows later cc-switch model changes: selecting a concrete entry always sends that entry's model ID while still using the live cc-switch endpoint and credential.
+The extension registers `cc-switch-codex/current`, which re-reads `%USERPROFILE%\.codex\config.toml` before each request and follows the current model selected in cc-switch. It also registers the concrete current model plus fixed entries for `gpt-5.5` and `gpt-5.6-sol`.
 
 When the effective model is `gpt-5.6-sol`, normal Responses requests use the top-level `model_reasoning_effort` value from `config.toml` directly as `reasoning.effort` (including provider-specific values such as `ultra`) instead of mapping through Pi's built-in thinking levels. The interactive footer watches `config.toml` and displays this effective value instead of the Shift+Tab level. Compaction and branch-summary requests keep their existing recovery-specific reasoning behavior.
 
@@ -220,76 +220,26 @@ When the effective model is `gpt-5.6-sol`, normal Responses requests use the top
 
 `cc-switch-claude` exposes Pi tools to Claude with Claude Code-compatible tool names such as `Bash`, `Read`, `Edit`, `MultiEdit`, `Write`, `LS`, `Grep`, and `Glob`. Tool execution still happens inside Pi through Pi's built-in tools; this package does not start a Claude Code subprocess.
 
-### cc-switch Context and Compaction
+### Codex Context and Compaction
 
-`cc-switch-codex` defaults to a 272,000-token nominal context window, matching Codex model metadata. Codex itself commonly exposes 258,400 usable tokens after its 5% safety margin. Override the value only when the relay documents a different limit:
+`cc-switch-codex` uses a conservative default context window of 200,000 tokens. This helps Pi compact before the upstream cc-switch Codex channel rejects a request with `context_length_exceeded`, even if the displayed Codex model advertises a larger cached context.
+
+Set `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` to override the value, for example:
 
 ```powershell
-$env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "400000"
+$env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
 pi --provider cc-switch-codex --model current
 ```
 
-Pi's built-in proactive threshold is `contextWindow - reserveTokens`; with Pi's default 16,384-token reserve, a 272,000-token model is not compacted until 255,616 tokens (about 94.0%). This extension therefore adds an earlier turn-boundary trigger for both cc-switch providers. It starts compaction after usage first exceeds 85% of the active model's context window (231,200 tokens for a 272,000-token model). An already-large resumed session is handled on its first completed turn.
-
-Configure the trigger with these environment variables. An absolute token value takes precedence over the ratio:
-
-```powershell
-# Disable only this extension's early trigger (Pi's built-in policy remains unchanged).
-$env:PI_CC_SWITCH_EARLY_COMPACTION = "0"
-
-# Or move the early trigger to 80%.
-$env:PI_CC_SWITCH_COMPACTION_TRIGGER_RATIO = "0.80"
-
-# Or use an absolute threshold.
-$env:PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS = "220000"
-
-# Disable automatic continuation after compaction interrupts a tool-use turn.
-$env:PI_CC_SWITCH_COMPACTION_AUTO_RESUME = "0"
-
-# Disable the safe 1M Claude summary fallback for an FC Codex route.
-$env:PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK = "0"
-```
-
-Run `/cc-switch` to inspect the effective threshold. Context usage counts cached input once because cached tokens still occupy the model's context: the Responses adapter subtracts the cached subset from `input` and records it separately as `cacheRead`. The check happens after a model turn, never in the middle of a request or tool execution. Pi's compactor aborts the pending agent continuation while generating the summary. After a successful automatic compaction, the extension sends a hidden continuation message when the interrupted turn still had tool work to finish; completed turns do not start an extra model turn. If a user message is already queued, compaction is deferred rather than discarding it. The post-compaction crossing state also prevents another immediate compaction merely because the summary and retained recent messages already occupy substantial context.
-
-Gateway overflow variants such as `context_window_exceeded`, `input_too_long`, and localized “context too long” messages are normalized to `context_length_exceeded`, allowing Pi's compact-and-retry fallback to recognize them. Compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies.
-
-#### Optional independent summary route
-
-The extension keeps the normal Codex/CC Switch route by default. When the active Codex route is the known FC endpoint that cannot handle compaction, an independent compaction route can be enabled explicitly; only non-secret route metadata is read from `%USERPROFILE%\.pi\agent\cc-switch-provider.json`. A safe loopback example is available at [`config/cc-switch-provider.example.json`](config/cc-switch-provider.example.json):
-
-```json
-{
-  "codexSummary": {
-    "baseUrl": "http://127.0.0.1:15721/v1",
-    "authRef": "cc-switch-proxy"
-  }
-}
-```
-
-With `cc-switch-proxy`, the route must be HTTP loopback and the extension sends CC Switch's non-secret `PROXY_MANAGED` placeholder. When `model` is omitted on either a loopback or explicitly authorized external route, the active live Codex model is reused; set `model` only to override it. For an external summary relay, use `authRef: "env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"` and provide the credential only in the local process environment. The file must never contain `apiKey`, token, or Authorization values. `PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` and `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` override the file metadata. The extension no longer reads or parses `~/.cc-switch/cc-switch.db`. Existing configurations that relied on automatic database discovery must now declare the auth reference when using an external route; no database credentials are migrated automatically.
-
-When the active Codex endpoint is the known FC route, and the independent route is either absent or missing its dedicated credential, the extension can safely generate the summary through an already configured **1M `cc-switch-claude` live route**. Claude's credential is sent only to Claude's own configured base URL; Codex credentials are never copied across hosts. Invalid route metadata and other security validation failures still fail closed instead of silently falling back. Set `PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK=0` to disable this behavior. If no eligible 1M Claude route exists, an unconfigured independent route continues to use the current Codex route.
-
-### Development checks
-
-```powershell
-npm test
-npm run check
-```
-
-The tests cover summary-route resolution, loopback/HTTPS boundaries, credential-reference validation, extension-entrypoint auto-discovery boundaries, and a static guard against reintroducing SQLite credential scraping.
+Pi compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies.
 
 ### Security
 
-Do not commit cc-switch credentials. This package reads only the following local configuration/runtime inputs:
+Do not commit cc-switch credentials. This package only reads local files created by cc-switch:
 
 - `%USERPROFILE%\.claude\settings.json`
 - `%USERPROFILE%\.codex\auth.json`
 - `%USERPROFILE%\.codex\config.toml`
-- optional `%USERPROFILE%\.pi\agent\cc-switch-provider.json` route metadata
-
-It does not read `~/.cc-switch/cc-switch.db`; summary credentials are either injected by the local CC Switch proxy or resolved from the explicitly named process environment variable at request time.
 
 ---
 
@@ -505,78 +455,28 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 ### Codex 模型
 
-该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取 `%USERPROFILE%\.codex\config.toml`，跟随 cc-switch 当前选择的模型。同时会注册当前具体模型，并固定额外注册 `gpt-5.5` 和 `gpt-5.6-sol`。只有 `current` 别名会继续跟随 cc-switch 后续的模型切换；明确选择具体模型时，请求始终使用该条目的模型 ID，但端点和凭据仍读取 cc-switch 当前配置。
+该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取 `%USERPROFILE%\.codex\config.toml`，跟随 cc-switch 当前选择的模型。同时会注册当前具体模型，并固定额外注册 `gpt-5.5` 和 `gpt-5.6-sol`。
 
 实际模型为 `gpt-5.6-sol` 时，普通 Responses 请求会直接读取 `config.toml` 顶层的 `model_reasoning_effort`，并原样作为 `reasoning.effort` 发送（包括 `ultra` 等中转自定义值），不再经过 Pi 内置 thinking 档位映射。交互式页脚会监听 `config.toml`，并用该实际生效值覆盖 Shift+Tab 档位显示。上下文压缩和分支摘要请求继续保留既有的恢复专用 reasoning 策略。
 
-### cc-switch 上下文与压缩
+### Codex 上下文与压缩
 
-`cc-switch-codex` 默认使用 272,000 token 标称上下文窗口，与 Codex 模型元数据一致；Codex 自身通常会预留 5% 安全空间，因此显示 258,400 可用 token。仅当中转明确声明了不同限制时才建议覆盖：
+`cc-switch-codex` 默认使用保守的 200,000 token 上下文窗口。即使 Codex 模型展示了更大的缓存上下文，这也能让 Pi 在上游 cc-switch Codex 通道返回 `context_length_exceeded` 前提前压缩。
+
+如需覆盖该值，可设置 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW`，例如：
 
 ```powershell
-$env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "400000"
+$env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
 pi --provider cc-switch-codex --model current
 ```
 
-Pi 内置的主动压缩阈值是 `contextWindow - reserveTokens`。按 Pi 默认预留的 16,384 token 计算，272,000 token 模型要到 255,616 token（约 94.0%）才会触发。因此本扩展为两个 cc-switch provider 增加了 turn 边界提前压缩：默认在上下文首次超过当前模型窗口的 85% 后启动（272,000 token 模型对应 231,200 token）；恢复一个已经超过阈值的旧会话时，会在第一个模型 turn 完成后处理。
-
-可通过以下环境变量调整。绝对 token 阈值优先于比例：
-
-```powershell
-# 只关闭本扩展的提前压缩；Pi 内置策略不受影响。
-$env:PI_CC_SWITCH_EARLY_COMPACTION = "0"
-
-# 或把提前压缩阈值改为 80%。
-$env:PI_CC_SWITCH_COMPACTION_TRIGGER_RATIO = "0.80"
-
-# 或直接设置绝对阈值。
-$env:PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS = "220000"
-
-# 关闭工具调用 turn 被压缩中断后的自动续跑。
-$env:PI_CC_SWITCH_COMPACTION_AUTO_RESUME = "0"
-
-# 关闭 Codex FC 路由的安全 1M Claude 摘要兜底。
-$env:PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK = "0"
-```
-
-可运行 `/cc-switch` 查看当前生效阈值。缓存命中的输入仍会占用模型上下文，因此需要计入一次；Responses 适配器会先从 `input` 中减去 cached 子集，再将其单独记录为 `cacheRead`，不会重复相加。检查只发生在模型 turn 结束后，不会在请求或工具执行中途压缩。Pi 压缩器生成摘要时会中止尚待继续的 Agent 运行；自动压缩成功后，如果被中断的 turn 仍有工具任务需要完成，扩展会发送一条隐藏续跑消息，已正常完成的 turn 不会额外启动模型。如果已有用户消息排队，则推迟压缩，避免丢弃该消息。扩展也会保留压缩后的阈值越界状态，不会仅因摘要和最近保留消息已占用较多上下文而立即再次压缩。
-
-扩展还会把 `context_window_exceeded`、`input_too_long` 和中文“上下文过长”等网关错误统一为 `context_length_exceeded`，使 Pi 的压缩重试兜底能够识别。Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。
-
-#### 可选的独立摘要路由
-
-默认情况下，扩展继续使用当前 Codex/CC Switch 路由。当当前 Codex route 是已知无法处理压缩的 FC 地址时，可以显式启用独立压缩路由；扩展只从 `%USERPROFILE%\.pi\agent\cc-switch-provider.json` 读取不含密钥的路由元数据。安全的 loopback 示例见 [`config/cc-switch-provider.example.json`](config/cc-switch-provider.example.json)：
-
-```json
-{
-  "codexSummary": {
-    "baseUrl": "http://127.0.0.1:15721/v1",
-    "authRef": "cc-switch-proxy"
-  }
-}
-```
-
-使用 `cc-switch-proxy` 时，路由必须是 HTTP loopback，扩展只发送 CC Switch 的非敏感占位符 `PROXY_MANAGED`。无论 loopback 还是已明确授权的外部路由，省略 `model` 时都会复用当前实际 Codex 模型；仅在需要覆盖时设置 `model`。外部摘要中转应将 `authRef` 写成 `"env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"`，并且只在本地进程环境中提供凭据。配置文件禁止出现 `apiKey`、token 或 Authorization 值。`PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` 和 `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` 会覆盖文件中的路由元数据。原来依赖 `cc-switch.db` 自动发现的外部摘要路由配置，现在必须显式声明 auth reference；扩展不会自动迁移数据库中的凭据。
-
-当前 Codex endpoint 为已知 FC 路由，且独立路由未配置或缺少自己的凭据时，扩展可以安全地通过已经配置的 **1M `cc-switch-claude` live 路由**生成摘要。Claude 凭据只会发送到 Claude 自己配置的 base URL，绝不会跨域复制 Codex 凭据；非法路由元数据及其它安全校验错误仍会直接失败，不会被静默掩盖。可设置 `PI_CC_SWITCH_CODEX_SUMMARY_CLAUDE_FALLBACK=0` 关闭该行为。如果不存在符合条件的 1M Claude 路由，未配置独立路由时才继续回退当前 Codex route。
-
-### 开发验证
-
-```powershell
-npm test
-npm run check
-```
-
-测试覆盖摘要路由解析、loopback/HTTPS 边界、凭据引用校验、扩展入口自动发现边界，并用静态检查防止重新引入 SQLite 凭据抓取。
+Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。
 
 ### 安全说明
 
-不要提交 cc-switch 凭据。本包只读取以下本地配置/运行时输入：
+不要提交 cc-switch 凭据。本包只读取 cc-switch 在本地创建的文件：
 
 - `%USERPROFILE%\.claude\settings.json`
 - `%USERPROFILE%\.codex\auth.json`
 - `%USERPROFILE%\.codex\config.toml`
-- 可选的 `%USERPROFILE%\.pi\agent\cc-switch-provider.json` 路由元数据
-
-本包不会读取 `~/.cc-switch/cc-switch.db`；摘要凭据要么由本地 CC Switch 代理注入，要么在请求时从明确指定的进程环境变量读取。
 
