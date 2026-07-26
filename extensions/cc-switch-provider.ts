@@ -24,6 +24,7 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import { resolveCodexSummaryRoute } from "./codex-summary-route.ts";
 
 type AuthKind = "api-key" | "bearer";
 
@@ -43,19 +44,6 @@ interface CodexConfig {
 	modelReasoningEffort?: string;
 }
 
-interface CcSwitchProviderLocalConfig {
-	codexSummary?: {
-		baseUrl?: string;
-	};
-}
-
-interface CodexSummaryRoute {
-	baseUrl: string;
-	apiKey: string;
-	model: string;
-	source: "env" | "config" | "default";
-}
-
 interface SseEvent {
 	event: string;
 	data: string;
@@ -73,18 +61,18 @@ type StreamBlock =
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as ("text" | "image")[];
 const TEXT_IMAGE_INPUT = ["text", "image"] as ("text" | "image")[];
-const DEFAULT_CODEX_CONTEXT_WINDOW = 200000;
+// Codex metadata declares 272K; native Codex applies a 5% safety margin and reports 258,400 usable tokens.
+const DEFAULT_CODEX_CONTEXT_WINDOW = 272000;
 const CODEX_CONTEXT_WINDOW_ENV = "PI_CC_SWITCH_CODEX_CONTEXT_WINDOW";
-const DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO = 0.5;
+const DEFAULT_CC_SWITCH_COMPACTION_TRIGGER_RATIO = 0.85;
 const CC_SWITCH_EARLY_COMPACTION_ENV = "PI_CC_SWITCH_EARLY_COMPACTION";
+const CC_SWITCH_COMPACTION_AUTO_RESUME_ENV = "PI_CC_SWITCH_COMPACTION_AUTO_RESUME";
 const CC_SWITCH_COMPACTION_TRIGGER_RATIO_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_RATIO";
 const CC_SWITCH_COMPACTION_TRIGGER_TOKENS_ENV = "PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS";
 const CC_SWITCH_COMPACTION_STATUS_KEY = "cc-switch-compaction";
-const CODEX_SUMMARY_BASE_URL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL";
-const DEFAULT_CODEX_SUMMARY_BASE_URL = "https://paid.tribiosapi.top/v1";
-const CC_SWITCH_PROVIDER_CONFIG_FILE = "cc-switch-provider.json";
-const CODEX_SUMMARY_MODEL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_MODEL";
-const CODEX_SUMMARY_API_KEY_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_API_KEY";
+const CC_SWITCH_COMPACTION_CONTINUATION_TYPE = "cc-switch-compaction-continuation";
+const CC_SWITCH_COMPACTION_CONTINUATION_PROMPT =
+	"Automatic context compaction interrupted an unfinished tool-use turn. Continue the user's current task from the compaction summary and retained messages. Do not ask the user to repeat the request or redo completed work; inspect the current state and proceed with the next unfinished step.";
 const CURRENT_CODEX_MODEL_ID = "current";
 const DEFAULT_CODEX_MODELS = ["gpt-5.5", "gpt-5.6-sol"] as const;
 const CODEX_CONFIG_REASONING_MODEL = "gpt-5.6-sol";
@@ -237,10 +225,18 @@ function positiveIntegerEnv(name: string): number | undefined {
 	return undefined;
 }
 
-function ccSwitchEarlyCompactionEnabled(): boolean {
-	const raw = process.env[CC_SWITCH_EARLY_COMPACTION_ENV]?.trim();
+function enabledByDefaultEnv(name: string): boolean {
+	const raw = process.env[name]?.trim();
 	if (!raw) return true;
 	return !/^(0|false|no|off)$/i.test(raw);
+}
+
+function ccSwitchEarlyCompactionEnabled(): boolean {
+	return enabledByDefaultEnv(CC_SWITCH_EARLY_COMPACTION_ENV);
+}
+
+function ccSwitchCompactionAutoResumeEnabled(): boolean {
+	return enabledByDefaultEnv(CC_SWITCH_COMPACTION_AUTO_RESUME_ENV);
 }
 
 function ccSwitchCompactionTriggerTokens(contextWindow: number): number {
@@ -392,9 +388,7 @@ function fcappKeepwarmProcessState(): FcappKeepwarmProcessState {
 }
 
 function fcappKeepwarmEnabledFromEnv(): boolean {
-	const raw = process.env[FCAPP_KEEPWARM_ENABLED_ENV]?.trim();
-	if (!raw) return true;
-	return !/^(0|false|no|off)$/i.test(raw);
+	return enabledByDefaultEnv(FCAPP_KEEPWARM_ENABLED_ENV);
 }
 
 function fcappKeepwarmEnabled(): boolean {
@@ -876,10 +870,9 @@ function uniqueStrings(values: string[]): string[] {
 // ============================================================
 // 数据提取层（纯函数）
 //
-// 把"从 env / settings_config 对象提取 Claude/Codex 配置"剥离成纯函数，
-// 让两条数据源共享同一套提取逻辑：
-//   - live-file 路径：读 ~/.claude/settings.json / ~/.codex/* → 进对应纯函数
-//   - SQLite 路径：读 ~/.cc-switch/cc-switch.db 的 settings_config JSON → 进同一套纯函数
+// 把“从 live settings/config 提取 Claude/Codex 配置”剥离成纯函数。
+// 凭据只来自 cc-switch 写入的 live 文件或 Pi runtime；独立摘要路由由
+// codex-summary-route.ts 通过显式 authRef 解析，绝不读取 cc-switch.db。
 // ============================================================
 
 type ExtractResult<T> = { ok: true; config: T } | { ok: false; error: string };
@@ -1284,124 +1277,18 @@ function installCcSwitchFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	});
 }
 
-function extractCodexBaseUrlFromConfigText(configText: string): string | undefined {
-	const toml = parseCodexConfigToml(configText);
-	const activeProviderId = toml.top.model_provider;
-	const section = activeProviderId
-		? toml.sections[`model_providers.${activeProviderId}`]
-		: undefined;
-	return section?.base_url ?? toml.top.base_url;
-}
-
-function normalizeUrlForCompare(value: string): string {
-	return value.replace(/\/+$/, "").toLowerCase();
-}
-
-function readCcSwitchDbText(): string | undefined {
-	const dbPath = join(homedir(), ".cc-switch", "cc-switch.db");
-	if (!existsSync(dbPath)) return undefined;
-	try {
-		return readFileSync(dbPath).toString("utf8");
-	} catch {
-		return undefined;
-	}
-}
-
-function decodeCcSwitchConfigText(raw: string): string {
-	return raw
-		.replace(/\\n/g, "\n")
-		.replace(/\\r/g, "\r")
-		.replace(/\\t/g, "\t")
-		.replace(/\\"/g, '"')
-		.replace(/\\\\/g, "\\");
-}
-
-function findCodexProviderInCcSwitchDb(baseUrl: string): { apiKey?: string; model?: string } | undefined {
-	const dbText = readCcSwitchDbText();
-	if (!dbText) return undefined;
-	const target = normalizeUrlForCompare(baseUrl);
-	const pattern = /\{"auth":\{"OPENAI_API_KEY":"([^"]+)"\},"config":"([\s\S]{0,4000}?)"\}https?:\/\//g;
-	let match: RegExpExecArray | null;
-	while ((match = pattern.exec(dbText)) !== null) {
-		const configText = decodeCcSwitchConfigText(match[2]);
-		const configBaseUrl = extractCodexBaseUrlFromConfigText(configText);
-		if (!configBaseUrl || normalizeUrlForCompare(configBaseUrl) !== target) continue;
-		const parsed = parseCodexConfigToml(configText);
-		return {
-			apiKey: match[1],
-			model: parsed.top.model,
-		};
-	}
-	return undefined;
-}
-
-function ccSwitchProviderConfigPath(): string {
-	return join(homedir(), ".pi", "agent", CC_SWITCH_PROVIDER_CONFIG_FILE);
-}
-
-function loadCcSwitchProviderLocalConfig(): CcSwitchProviderLocalConfig | undefined {
-	const configPath = ccSwitchProviderConfigPath();
-	if (!existsSync(configPath)) return undefined;
-	const config = readJsonObject(configPath);
-	if (!config) {
-		throw new Error(`独立压缩中转配置文件不是有效的 JSON 对象：${configPath}`);
-	}
-	if (config.codexSummary !== undefined && !isRecord(config.codexSummary)) {
-		throw new Error(`独立压缩中转配置 codexSummary 必须是 JSON 对象：${configPath}`);
-	}
-	const codexSummary = isRecord(config.codexSummary) ? config.codexSummary : undefined;
-	return {
-		codexSummary: codexSummary
-			? { baseUrl: stringValue(codexSummary.baseUrl) }
-			: undefined,
-	};
-}
-
-function validateCodexSummaryBaseUrl(baseUrl: string): string {
-	try {
-		const parsed = new URL(baseUrl);
-		if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("unsupported protocol");
-		return baseUrl;
-	} catch {
-		throw new Error(`独立压缩中转 baseUrl 必须是有效的 HTTP/HTTPS 地址：${baseUrl}`);
-	}
-}
-
-function codexSummaryBaseUrlConfig(): Pick<CodexSummaryRoute, "baseUrl" | "source"> {
-	const envBaseUrl = process.env[CODEX_SUMMARY_BASE_URL_ENV]?.trim();
-	if (envBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(envBaseUrl), source: "env" };
-
-	const fileBaseUrl = loadCcSwitchProviderLocalConfig()?.codexSummary?.baseUrl;
-	if (fileBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(fileBaseUrl), source: "config" };
-
-	return { baseUrl: DEFAULT_CODEX_SUMMARY_BASE_URL, source: "default" };
-}
-
-function resolveIndependentCodexSummaryRoute(): CodexSummaryRoute {
-	const { baseUrl, source } = codexSummaryBaseUrlConfig();
-	if (isFcappAdmissionRetryEndpoint(baseUrl)) {
-		throw new Error(`独立压缩中转不能指向不支持压缩的 FC 地址：${baseUrl}`);
-	}
-
-	const provider = findCodexProviderInCcSwitchDb(baseUrl);
-	const model = process.env[CODEX_SUMMARY_MODEL_ENV]?.trim() || provider?.model;
-	const apiKey = process.env[CODEX_SUMMARY_API_KEY_ENV]?.trim() || provider?.apiKey;
-	if (!model || !apiKey) {
-		throw new Error(
-			`未找到独立压缩中转配置：${baseUrl}。请在 cc-switch 中添加 base_url 完全相同且包含模型和 API Key 的 Codex Provider，或设置 ${CODEX_SUMMARY_MODEL_ENV} 与 ${CODEX_SUMMARY_API_KEY_ENV}。`,
-		);
-	}
-	return { baseUrl, apiKey, model, source };
-}
-
 function codexSummaryRouteStatus(codex: CodexConfig): string {
 	if (!isFcappAdmissionRetryEndpoint(codex.baseUrl)) {
 		return `Codex Summary: 跟随当前中转 ${codex.baseUrl}`;
 	}
 	try {
-		const route = resolveIndependentCodexSummaryRoute();
-		const sourceLabel = route.source === "env" ? "环境变量" : route.source === "config" ? "配置文件" : "默认配置";
-		return `Codex Summary: ${route.model} -> ${route.baseUrl} [FC 独立压缩/${sourceLabel}]`;
+		const route = resolveCodexSummaryRoute({ liveModel: codex.model });
+		if (!route) {
+			return "Codex Summary: 跟随当前中转（未配置独立路由）";
+		}
+		const sourceLabel = route.configSource === "environment" ? "环境变量配置" : "本地引用配置";
+		const authLabel = route.authSource === "cc-switch-proxy" ? "CC Switch 代理认证" : "进程环境认证";
+		return `Codex Summary: ${route.model} -> ${route.baseUrl} [FC 独立压缩/${sourceLabel}/${authLabel}]`;
 	} catch (error) {
 		return `Codex Summary: 配置错误 ${error instanceof Error ? error.message : String(error)}`;
 	}
@@ -2818,7 +2705,9 @@ function streamCcSwitchCodexResponses(
 			if (!apiKey) throw new Error("Missing cc-switch Codex credential");
 
 			const useIndependentSummaryRoute = isSummarizationContext(context) && isFcappAdmissionRetryEndpoint(runtimeModel.baseUrl);
-			const summaryRoute = useIndependentSummaryRoute ? resolveIndependentCodexSummaryRoute() : undefined;
+			const summaryRoute = useIndependentSummaryRoute
+				? resolveCodexSummaryRoute({ liveModel: runtimeModel.id })
+				: undefined;
 			const requestBaseUrl = summaryRoute?.baseUrl ?? runtimeModel.baseUrl;
 			const requestApiKey = summaryRoute?.apiKey ?? apiKey;
 			const requestModelId = summaryRoute?.model ?? runtimeModel.id;
@@ -3209,8 +3098,8 @@ export default function (pi: ExtensionAPI) {
 	// and is checked after the complete agent run. cc-switch sessions often have
 	// long tool chains, so trigger at a turn boundary as soon as the configured
 	// ratio is crossed. ctx.compact() aborts the pending continuation before it
-	// summarizes, preventing the same tool chain from growing past the gateway.
-	pi.on("turn_end", (_event, ctx) => {
+	// summarizes; a hidden follow-up resumes unfinished tool-use turns afterward.
+	pi.on("turn_end", (event, ctx) => {
 		if (!ccSwitchEarlyCompactionEnabled() || !isCcSwitchProvider(ctx.model?.provider)) {
 			previousContextTokens = undefined;
 			previousCompactionTriggerTokens = undefined;
@@ -3245,13 +3134,22 @@ export default function (pi: ExtensionAPI) {
 		previousCompactionTriggerTokens = triggerTokens;
 		if ((!crossedTrigger && !retryDue) || earlyCompactionInFlight) return;
 
+		// compact() aborts Pi's current run and clears its queued steer/follow-up
+		// messages. Defer one turn rather than discard a user's pending message.
+		if (ctx.hasPendingMessages()) {
+			previousContextTokens = triggerTokens;
+			return;
+		}
+
+		const resumeInterruptedToolTurn =
+			ccSwitchCompactionAutoResumeEnabled() && event.message.stopReason === "toolUse";
 		earlyCompactionRetryAtTokens = undefined;
 		earlyCompactionInFlight = true;
 		const status = `自动压缩: ${formatFooterTokens(currentTokens)} > ${formatFooterTokens(triggerTokens)}`;
 		ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, status);
 		if (ctx.hasUI) ctx.ui.notify(`${status}，正在生成摘要`, "info");
 		ctx.compact({
-			onComplete: () => {
+			onComplete: (result) => {
 				// Suppress an immediate second compaction if keepRecentTokens leaves
 				// the rebuilt context above this extension's early threshold. A later
 				// below-to-above crossing or threshold change can trigger again.
@@ -3260,7 +3158,29 @@ export default function (pi: ExtensionAPI) {
 				earlyCompactionRetryAtTokens = undefined;
 				earlyCompactionInFlight = false;
 				ctx.ui.setStatus(CC_SWITCH_COMPACTION_STATUS_KEY, undefined);
-				if (ctx.hasUI) ctx.ui.notify("上下文自动压缩完成", "info");
+
+				const canResume = resumeInterruptedToolTurn && !ctx.hasPendingMessages();
+				if (canResume) {
+					pi.sendMessage(
+						{
+							customType: CC_SWITCH_COMPACTION_CONTINUATION_TYPE,
+							content: CC_SWITCH_COMPACTION_CONTINUATION_PROMPT,
+							display: false,
+							details: {
+								reason: "early-compaction",
+								tokensBefore: result.tokensBefore,
+							},
+						},
+						{ triggerTurn: true, deliverAs: "followUp" },
+					);
+				}
+
+				if (ctx.hasUI) {
+					ctx.ui.notify(
+						canResume ? "上下文自动压缩完成，正在继续未完成的任务" : "上下文自动压缩完成",
+						"info",
+					);
+				}
 			},
 			onError: (error) => {
 				earlyCompactionInFlight = false;
