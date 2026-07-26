@@ -6,6 +6,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import {
+	CLAUDE_CURRENT_MODEL_ENV,
+	resolveClaudeCurrentModel,
+} from "../lib/claude-model-selection.ts";
+
+import {
 	type CcSwitchCliPaths,
 	resolveCcSwitchCliPaths,
 } from "../lib/cc-switch-config-paths.ts";
@@ -101,9 +106,6 @@ const CURRENT_CODEX_MODEL_ID = "current";
 const DEFAULT_CODEX_MODELS = ["gpt-5.5", "gpt-5.6-sol"] as const;
 const CODEX_CONFIG_REASONING_MODEL = "gpt-5.6-sol";
 const CURRENT_CLAUDE_MODEL_ID = "current";
-const DEFAULT_CLAUDE_OPUS_MODEL = "claude-opus-5";
-const DEFAULT_CLAUDE_SONNET_MODEL = "claude-sonnet-5";
-const DEFAULT_CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 // 与 DEFAULT_CODEX_MODELS 同理：除了 cc-switch 当前模型，再固定暴露一组可切换的 Claude 模型。
 // 新增 opus-5 的同时保留 4.8 / 4.7 / 4.6：中转开通的渠道各不相同，匹配不到渠道的模型
 // 会被 oneapi 类中转以 429「Upstream rate limit exceeded」拒掉，所以这里多留几级可回退。
@@ -981,51 +983,6 @@ function uniqueStrings(values: string[]): string[] {
 
 type ExtractResult<T> = { ok: true; config: T } | { ok: false; error: string };
 
-function currentClaudeModelFromEnv(env: Record<string, unknown>): string | undefined {
-	return (
-		stringValue(env.ANTHROPIC_MODEL) ??
-		stringValue(env.ANTHROPIC_DEFAULT_SONNET_MODEL) ??
-		stringValue(env.ANTHROPIC_DEFAULT_OPUS_MODEL) ??
-		stringValue(env.ANTHROPIC_DEFAULT_HAIKU_MODEL)
-	);
-}
-
-function claudeModelSuffix(model: string): string {
-	return model.match(/\[[^\]]+\]\s*$/)?.[0].trim() ?? "";
-}
-
-function stripClaudeModelSuffix(model: string): string {
-	return model.replace(/\[[^\]]+\]\s*$/, "").trim();
-}
-
-function withClaudeModelSuffix(model: string, suffix: string): string {
-	if (!suffix) return model;
-	return `${stripClaudeModelSuffix(model)}${suffix}`;
-}
-
-function resolveClaudeSettingsModel(settingsModel: unknown, env: Record<string, unknown>): string | undefined {
-	const model = stringValue(settingsModel);
-	if (!model) return undefined;
-
-	const suffix = claudeModelSuffix(model);
-	const baseModel = stripClaudeModelSuffix(model);
-	const normalized = baseModel.toLowerCase();
-	if (normalized === "opus" || normalized === "best") {
-		return withClaudeModelSuffix(stringValue(env.ANTHROPIC_DEFAULT_OPUS_MODEL) ?? DEFAULT_CLAUDE_OPUS_MODEL, suffix);
-	}
-	if (normalized === "sonnet") {
-		return withClaudeModelSuffix(stringValue(env.ANTHROPIC_DEFAULT_SONNET_MODEL) ?? DEFAULT_CLAUDE_SONNET_MODEL, suffix);
-	}
-	if (normalized === "haiku") {
-		return withClaudeModelSuffix(stringValue(env.ANTHROPIC_DEFAULT_HAIKU_MODEL) ?? DEFAULT_CLAUDE_HAIKU_MODEL, suffix);
-	}
-	return model;
-}
-
-function currentClaudeModelFromSettings(settings: Record<string, unknown>, env: Record<string, unknown>): string | undefined {
-	return currentClaudeModelFromEnv(env) ?? resolveClaudeSettingsModel(settings.model, env);
-}
-
 function extractClaudeFromSettings(settings: Record<string, unknown>, env: Record<string, unknown>): ExtractResult<ClaudeConfig> {
 	const baseUrl = stringValue(env.ANTHROPIC_BASE_URL);
 	const authToken = stringValue(env.ANTHROPIC_AUTH_TOKEN);
@@ -1035,7 +992,7 @@ function extractClaudeFromSettings(settings: Record<string, unknown>, env: Recor
 		return { ok: false, error: "neither env.ANTHROPIC_AUTH_TOKEN nor env.ANTHROPIC_API_KEY is set" };
 	}
 
-	const currentModel = currentClaudeModelFromSettings(settings, env);
+	const currentModel = resolveClaudeCurrentModel(settings, env);
 	return {
 		ok: true,
 		config: {
@@ -1604,7 +1561,9 @@ function resolveRuntimeClaudeModel(model: Model<Api>, liveConfig?: ClaudeConfig)
 		return model;
 	}
 	if (!liveConfig?.currentModel) {
-		throw new Error("cc-switch Claude current model is not set in the configured Claude settings file");
+		throw new Error(
+			`cc-switch Claude current model is not set in the configured Claude settings file; set ${CLAUDE_CURRENT_MODEL_ENV} or select a concrete model`,
+		);
 	}
 	const currentModel = liveConfig.currentModel;
 	return {

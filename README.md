@@ -210,6 +210,19 @@ The extension reads CC Switch's device-local `%USERPROFILE%\.cc-switch\settings.
 
 Absolute paths and CC Switch's `~` forms are accepted. Ambiguous relative paths fail closed to the default directories because Pi and the CC Switch GUI can have different working directories. Restart Pi or run `/reload` after changing a directory in CC Switch. No Provider payload, API key, database content, or unrelated CC Switch setting is imported by this path resolver.
 
+### Optional Outbound Network Proxy
+
+A local Clash/Mihomo HTTP proxy is an **outbound network proxy**, not a CC Switch API relay. For example, if it listens at `http://127.0.0.1:7897`, configure the current PowerShell session like this:
+
+```powershell
+$env:HTTP_PROXY = "http://127.0.0.1:7897"
+$env:HTTPS_PROXY = "http://127.0.0.1:7897"
+$env:NO_PROXY = "127.0.0.1,localhost,::1"
+$env:NODE_USE_ENV_PROXY = "1"
+```
+
+`NO_PROXY` keeps loopback addresses direct. Do not use port `7897` as `probe:cc-switch --base-url`; that probe requires the optional CC Switch API relay at `127.0.0.1:15721`. The outbound proxy works with direct external relay routes and does not require the CC Switch desktop process.
+
 ### Claude Models
 
 The extension registers `cc-switch-claude/current`, which re-reads the active Claude settings file before each request and follows the current model selected in cc-switch. It also registers the concrete model currently written by cc-switch, such as `mimo-v2.5-pro`.
@@ -220,7 +233,7 @@ Note that a `429 Upstream rate limit exceeded` from a relay is not always a real
 
 The `opus` / `sonnet` / `haiku` aliases in `settings.json` resolve to `claude-opus-5`, `claude-sonnet-5` and `claude-haiku-4-5-20251001` respectively, unless `ANTHROPIC_DEFAULT_*_MODEL` overrides them.
 
-To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claude env config as a comma- or space-separated list.
+To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claude env config as a comma- or space-separated list. If the live Claude settings file has no selected model, set `PI_CC_SWITCH_CLAUDE_CURRENT_MODEL` to an explicit model ID (for example `claude-opus-5`) so the `current` alias has a safe, explicit target.
 
 ### Codex Models
 
@@ -270,7 +283,7 @@ npm test
 npm run check
 ```
 
-The tests use Node's native TypeScript stripping and cover CC Switch CLI-directory override resolution, catalog ownership, size/count limits, metadata projection, fallback behavior, concrete-model selection, and context-window capping. `npm run check` is a stripped-TypeScript syntax check, not a strict `tsc` typecheck.
+The tests use Node's native TypeScript stripping and cover Claude current-model precedence/alias resolution, CC Switch CLI-directory override resolution, catalog ownership, size/count limits, metadata projection, fallback behavior, concrete-model selection, and context-window capping. `npm run check` is a stripped-TypeScript syntax check, not a strict `tsc` typecheck.
 
 ### Security
 
@@ -491,6 +504,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 支持绝对路径和 CC Switch 的 `~` 写法。相对路径存在 Pi 与 CC Switch GUI 工作目录不一致的歧义，因此会安全回退默认目录。通过 CC Switch 修改目录后，请重启 Pi 或执行 `/reload`。路径解析器不会导入 Provider 内容、API Key、数据库内容或其它无关 CC Switch 设置。
 
+### 可选的出站网络代理
+
+本机 Clash/Mihomo 的 HTTP 代理属于**出站网络代理**，不是 CC Switch API relay。例如代理监听 `http://127.0.0.1:7897` 时，可在当前 PowerShell 会话设置：
+
+```powershell
+$env:HTTP_PROXY = "http://127.0.0.1:7897"
+$env:HTTPS_PROXY = "http://127.0.0.1:7897"
+$env:NO_PROXY = "127.0.0.1,localhost,::1"
+$env:NODE_USE_ENV_PROXY = "1"
+```
+
+`NO_PROXY` 让 loopback 地址保持直连。不要把 `7897` 作为 `probe:cc-switch --base-url`；该 probe 只接受可选的 CC Switch API relay（默认 `127.0.0.1:15721`）。使用外部中转直连时，只需要出站代理，不需要 CC Switch 桌面进程。
+
 ### Claude 模型
 
 该扩展会注册 `cc-switch-claude/current`，并在每次请求前重新读取当前生效的 Claude settings 文件，跟随 cc-switch 当前选择的模型。它也会注册 cc-switch 当前写入的具体模型，例如 `mimo-v2.5-pro`。
@@ -501,7 +527,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 `settings.json` 里的 `opus` / `sonnet` / `haiku` 别名分别解析为 `claude-opus-5`、`claude-sonnet-5`、`claude-haiku-4-5-20251001`，除非 `ANTHROPIC_DEFAULT_*_MODEL` 另有覆盖。
 
-如需追加固定模型，可在 cc-switch 的 Claude env 配置中设置 `PI_CC_SWITCH_CLAUDE_MODELS`，使用英文逗号或空格分隔多个模型。
+如需追加固定模型，可在 cc-switch 的 Claude env 配置中设置 `PI_CC_SWITCH_CLAUDE_MODELS`，使用英文逗号或空格分隔多个模型。如果 live Claude settings 没有记录当前模型，可设置 `PI_CC_SWITCH_CLAUDE_CURRENT_MODEL` 为明确的模型 ID（例如 `claude-opus-5`），让 `current` alias 有一个安全且明确的目标。
 
 ### Claude 工具
 
@@ -551,7 +577,7 @@ npm test
 npm run check
 ```
 
-测试使用 Node 原生 TypeScript stripping，覆盖 CC Switch CLI 目录覆盖解析、catalog ownership、大小/数量限制、元数据投影、回退行为、具体模型选择和上下文上限。`npm run check` 是剥离 TypeScript 类型后的语法检查，并不等同于严格的 `tsc` 类型检查。
+测试使用 Node 原生 TypeScript stripping，覆盖 Claude current 模型优先级/别名解析、CC Switch CLI 目录覆盖解析、catalog ownership、大小/数量限制、元数据投影、回退行为、具体模型选择和上下文上限。`npm run check` 是剥离 TypeScript 类型后的语法检查，并不等同于严格的 `tsc` 类型检查。
 
 ### 安全说明
 
