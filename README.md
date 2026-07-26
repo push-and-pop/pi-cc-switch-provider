@@ -212,7 +212,7 @@ To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claud
 
 ### Codex Models
 
-The extension registers `cc-switch-codex/current`, which re-reads `%USERPROFILE%\.codex\config.toml` before each request and follows the current model selected in cc-switch. It also registers the concrete current model plus fixed entries for `gpt-5.5` and `gpt-5.6-sol`.
+The extension registers `cc-switch-codex/current`, which re-reads `%USERPROFILE%\.codex\config.toml` before each request and follows the current model selected in cc-switch. It also registers the concrete current model plus fixed entries for `gpt-5.5` and `gpt-5.6-sol`. Only the `current` alias follows later cc-switch model changes: selecting a concrete entry always sends that entry's model ID while still using the live cc-switch endpoint and credential.
 
 When the effective model is `gpt-5.6-sol`, normal Responses requests use the top-level `model_reasoning_effort` value from `config.toml` directly as `reasoning.effort` (including provider-specific values such as `ultra`) instead of mapping through Pi's built-in thinking levels. The interactive footer watches `config.toml` and displays this effective value instead of the Shift+Tab level. Compaction and branch-summary requests keep their existing recovery-specific reasoning behavior.
 
@@ -220,18 +220,33 @@ When the effective model is `gpt-5.6-sol`, normal Responses requests use the top
 
 `cc-switch-claude` exposes Pi tools to Claude with Claude Code-compatible tool names such as `Bash`, `Read`, `Edit`, `MultiEdit`, `Write`, `LS`, `Grep`, and `Glob`. Tool execution still happens inside Pi through Pi's built-in tools; this package does not start a Claude Code subprocess.
 
-### Codex Context and Compaction
+### cc-switch Context and Compaction
 
-`cc-switch-codex` uses a conservative default context window of 200,000 tokens. This helps Pi compact before the upstream cc-switch Codex channel rejects a request with `context_length_exceeded`, even if the displayed Codex model advertises a larger cached context.
-
-Set `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` to override the value, for example:
+`cc-switch-codex` uses a conservative default context window of 200,000 tokens. Set `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` to override it:
 
 ```powershell
 $env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
 pi --provider cc-switch-codex --model current
 ```
 
-Pi compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies.
+Pi's built-in proactive threshold is `contextWindow - reserveTokens`; with Pi's default 16,384-token reserve, a 200,000-token model is not compacted until 183,616 tokens (about 91.8%). This extension therefore adds an earlier turn-boundary trigger for both cc-switch providers. It starts compaction after usage first exceeds 50% of the active model's context window. An already-large resumed session is handled on its first completed turn.
+
+Configure the trigger with these environment variables. An absolute token value takes precedence over the ratio:
+
+```powershell
+# Disable only this extension's early trigger (Pi's built-in policy remains unchanged).
+$env:PI_CC_SWITCH_EARLY_COMPACTION = "0"
+
+# Or move the early trigger to 65%.
+$env:PI_CC_SWITCH_COMPACTION_TRIGGER_RATIO = "0.65"
+
+# Or use an absolute threshold.
+$env:PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS = "100000"
+```
+
+Run `/cc-switch` to inspect the effective threshold. The check happens after a model turn, never in the middle of a request or tool execution. Calling Pi's compactor interrupts the pending agent continuation, so a long tool chain can pause at that boundary; send a follow-up prompt after the summary if it does not resume automatically.
+
+Gateway overflow variants such as `context_window_exceeded`, `input_too_long`, and localized “context too long” messages are normalized to `context_length_exceeded`, allowing Pi's compact-and-retry fallback to recognize them. Compaction and branch-summary requests are sent to Codex without reasoning, even when the active chat uses a high thinking level. This keeps overflow recovery text-only and avoids `invalid_responses_request` errors from Responses-compatible cc-switch proxies.
 
 ### Security
 
@@ -455,22 +470,37 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 ### Codex 模型
 
-该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取 `%USERPROFILE%\.codex\config.toml`，跟随 cc-switch 当前选择的模型。同时会注册当前具体模型，并固定额外注册 `gpt-5.5` 和 `gpt-5.6-sol`。
+该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取 `%USERPROFILE%\.codex\config.toml`，跟随 cc-switch 当前选择的模型。同时会注册当前具体模型，并固定额外注册 `gpt-5.5` 和 `gpt-5.6-sol`。只有 `current` 别名会继续跟随 cc-switch 后续的模型切换；明确选择具体模型时，请求始终使用该条目的模型 ID，但端点和凭据仍读取 cc-switch 当前配置。
 
 实际模型为 `gpt-5.6-sol` 时，普通 Responses 请求会直接读取 `config.toml` 顶层的 `model_reasoning_effort`，并原样作为 `reasoning.effort` 发送（包括 `ultra` 等中转自定义值），不再经过 Pi 内置 thinking 档位映射。交互式页脚会监听 `config.toml`，并用该实际生效值覆盖 Shift+Tab 档位显示。上下文压缩和分支摘要请求继续保留既有的恢复专用 reasoning 策略。
 
-### Codex 上下文与压缩
+### cc-switch 上下文与压缩
 
-`cc-switch-codex` 默认使用保守的 200,000 token 上下文窗口。即使 Codex 模型展示了更大的缓存上下文，这也能让 Pi 在上游 cc-switch Codex 通道返回 `context_length_exceeded` 前提前压缩。
-
-如需覆盖该值，可设置 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW`，例如：
+`cc-switch-codex` 默认使用保守的 200,000 token 上下文窗口。可通过 `PI_CC_SWITCH_CODEX_CONTEXT_WINDOW` 覆盖：
 
 ```powershell
 $env:PI_CC_SWITCH_CODEX_CONTEXT_WINDOW = "256000"
 pi --provider cc-switch-codex --model current
 ```
 
-Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。
+Pi 内置的主动压缩阈值是 `contextWindow - reserveTokens`。按 Pi 默认预留的 16,384 token 计算，200,000 token 模型要到 183,616 token（约 91.8%）才会触发，而不是 50%。因此本扩展为两个 cc-switch provider 增加了 turn 边界提前压缩：默认在上下文首次超过当前模型窗口的 50% 后启动；恢复一个已经超过阈值的旧会话时，会在第一个模型 turn 完成后处理。
+
+可通过以下环境变量调整。绝对 token 阈值优先于比例：
+
+```powershell
+# 只关闭本扩展的提前压缩；Pi 内置策略不受影响。
+$env:PI_CC_SWITCH_EARLY_COMPACTION = "0"
+
+# 或把提前压缩阈值改为 65%。
+$env:PI_CC_SWITCH_COMPACTION_TRIGGER_RATIO = "0.65"
+
+# 或直接设置绝对阈值。
+$env:PI_CC_SWITCH_COMPACTION_TRIGGER_TOKENS = "100000"
+```
+
+可运行 `/cc-switch` 查看当前生效阈值。检查只发生在模型 turn 结束后，不会在请求或工具执行中途压缩。调用 Pi 压缩器会中止尚待继续的 Agent 运行，因此长工具链可能在该边界暂停；如果摘要后没有自动继续，再发送一条继续提示即可。
+
+扩展还会把 `context_window_exceeded`、`input_too_long` 和中文“上下文过长”等网关错误统一为 `context_length_exceeded`，使 Pi 的压缩重试兜底能够识别。Pi 的上下文压缩和分支摘要请求会以无 reasoning 的纯文本请求发给 Codex，即使当前聊天使用 high thinking。这样可以降低 Responses 兼容 cc-switch 中转在溢出恢复时返回 `invalid_responses_request` 的概率。
 
 ### 安全说明
 
