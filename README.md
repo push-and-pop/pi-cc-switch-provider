@@ -264,7 +264,7 @@ The extension keeps the normal Codex/CC Switch route by default. When the active
 }
 ```
 
-With `cc-switch-proxy`, the route must be HTTP loopback; the extension sends CC Switch's non-secret `PROXY_MANAGED` placeholder and, when `model` is omitted, reuses the current live model. For an explicitly authorized external summary relay, use `authRef: "env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"` and provide the credential only in the local process environment. The file must never contain `apiKey`, token, or Authorization values. `PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` and `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` override the file metadata. The extension no longer reads or parses `~/.cc-switch/cc-switch.db`. Existing configurations that relied on automatic database discovery must now declare the summary model and auth reference when using an external route; no database credentials are migrated automatically. If no explicit summary route is configured, it falls back to the current route instead of a hidden hard-coded third-party endpoint.
+With `cc-switch-proxy`, the route must be HTTP loopback and the extension sends CC Switch's non-secret `PROXY_MANAGED` placeholder. When `model` is omitted on either a loopback or explicitly authorized external route, the active live Codex model is reused; set `model` only to override it. For an external summary relay, use `authRef: "env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"` and provide the credential only in the local process environment. The file must never contain `apiKey`, token, or Authorization values. `PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` and `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` override the file metadata. The extension no longer reads or parses `~/.cc-switch/cc-switch.db`. Existing configurations that relied on automatic database discovery must now declare the auth reference when using an external route; no database credentials are migrated automatically. If no explicit summary route is configured, it falls back to the current route instead of a hidden hard-coded third-party endpoint.
 
 ### Development checks
 
@@ -548,7 +548,7 @@ $env:PI_CC_SWITCH_COMPACTION_AUTO_RESUME = "0"
 }
 ```
 
-使用 `cc-switch-proxy` 时，路由必须是 HTTP loopback；扩展只发送 CC Switch 的非敏感占位符 `PROXY_MANAGED`，省略 `model` 时复用当前模型。如果使用明确授权的外部摘要中转，请将 `authRef` 写成 `"env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"`，并且只在本地进程环境中提供凭据。配置文件禁止出现 `apiKey`、token 或 Authorization 值。`PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` 和 `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` 会覆盖文件中的路由元数据。原来依赖 `cc-switch.db` 自动发现的外部摘要路由配置，现在必须显式声明摘要模型和 auth reference；扩展不会自动迁移数据库中的凭据。未配置独立摘要路由时，会回退到当前路由，不再隐式访问硬编码的第三方地址。
+使用 `cc-switch-proxy` 时，路由必须是 HTTP loopback，扩展只发送 CC Switch 的非敏感占位符 `PROXY_MANAGED`。无论 loopback 还是已明确授权的外部路由，省略 `model` 时都会复用当前实际 Codex 模型；仅在需要覆盖时设置 `model`。外部摘要中转应将 `authRef` 写成 `"env:PI_CC_SWITCH_CODEX_SUMMARY_API_KEY"`，并且只在本地进程环境中提供凭据。配置文件禁止出现 `apiKey`、token 或 Authorization 值。`PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL` 和 `PI_CC_SWITCH_CODEX_SUMMARY_MODEL` 会覆盖文件中的路由元数据。原来依赖 `cc-switch.db` 自动发现的外部摘要路由配置，现在必须显式声明 auth reference；扩展不会自动迁移数据库中的凭据。未配置独立摘要路由时，会回退到当前路由，不再隐式访问硬编码的第三方地址。
 
 ### 开发验证
 

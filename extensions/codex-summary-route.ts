@@ -165,11 +165,14 @@ export function resolveCodexSummaryRoute(
 	}
 
 	const environmentModel = nonEmptyString(environment[CODEX_SUMMARY_MODEL_ENV]);
-	const model = environmentModel
-		?? fileRoute?.model
-		?? (authRef === CODEX_SUMMARY_PROXY_AUTH_REF ? options.liveModel : undefined);
+	// The summary route normally serves the same logical model as the active
+	// Codex route. `model` is only an optional override, regardless of whether
+	// authentication is supplied by loopback CC Switch or an explicit env ref.
+	const model = environmentModel ?? fileRoute?.model ?? options.liveModel;
 	if (!model) {
-		throw new Error(`独立压缩中转缺少模型；请设置 codexSummary.model 或 ${CODEX_SUMMARY_MODEL_ENV}`);
+		throw new Error(
+			`独立压缩中转缺少模型；当前模型不可用，请设置 codexSummary.model 或 ${CODEX_SUMMARY_MODEL_ENV}`,
+		);
 	}
 
 	const environmentApiKey = nonEmptyString(environment[CODEX_SUMMARY_API_KEY_ENV]);

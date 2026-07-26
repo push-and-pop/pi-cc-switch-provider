@@ -48,6 +48,23 @@ test("external summary route requires the fixed environment credential reference
 	assert.equal(route.apiKey, "test-runtime-credential");
 });
 
+test("external summary route reuses the live model when no override is configured", () => {
+	const route = resolveCodexSummaryRoute({
+		environment: { [CODEX_SUMMARY_API_KEY_ENV]: "test-runtime-credential" },
+		localConfig: {
+			codexSummary: {
+				baseUrl: "https://relay.example/v1",
+				authRef: CODEX_SUMMARY_ENV_AUTH_REF,
+			},
+		},
+		liveModel: "gpt-live",
+	});
+
+	assert.ok(route);
+	assert.equal(route.model, "gpt-live");
+	assert.equal(route.authSource, "environment");
+});
+
 test("loopback summary route uses the CC Switch placeholder and live model", () => {
 	const route = resolveCodexSummaryRoute({
 		environment: {},
