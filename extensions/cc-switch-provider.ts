@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { fetch as undiciFetch, ProxyAgent } from "undici";
 
 import {
 	CLAUDE_CURRENT_MODEL_ENV,
@@ -24,6 +25,12 @@ import {
 	loadOwnedCodexModelCatalog,
 	resolveCodexRequestModelId,
 } from "../lib/codex-model-catalog.ts";
+
+import {
+	ANYROUTER_PROXY_ENV,
+	isAnyrouterHttpsUrl,
+	resolveAnyrouterProxyUrl,
+} from "../lib/selective-proxy.ts";
 
 import {
 	type Api,
@@ -162,8 +169,9 @@ const FCAPP_KEEPWARM_CIRCUIT_BREAKER_STATUSES = new Set([401, 403, 429]);
 // 只对指定 FC 中转站做入场重试：请求拿到可读 SSE 响应后，流中途错误仍交给 Pi 会话级重试处理。
 // 这样可以无限等待入口名额，同时避免半条 assistant 消息或工具调用被 provider 内部重放。
 
-// FC keepwarm 默认永久开启：加载到 fcapp 配置后立即走一次真实 Responses 请求；空闲时每分钟用轻量 hi 维活，真实请求会重置计时。
-// 主 FC 不可用时按顺序尝试 anyrouter.top；初始状态可用 PI_CC_SWITCH_FCAPP_KEEPWARM=0/false/no/off 关闭，风控状态码会自动熔断。
+// FC keepwarm 默认永久开启：加载到 FC 或 anyrouter.top 配置后立即走一次真实 Responses 请求；空闲时每分钟用轻量 hi 维活，真实请求会重置计时。
+// FC 作为当前入口时，主地址不可用会尝试 anyrouter.top；AnyRouter 作为当前入口时只保温自身，避免把其凭据反向发送给 FC。
+// 初始状态可用 PI_CC_SWITCH_FCAPP_KEEPWARM=0/false/no/off 关闭，风控状态码会自动熔断。
 type FcappKeepwarmMode = "responses" | "models";
 type FcappKeepwarmEndpointRole = "primary" | "fallback";
 
@@ -210,8 +218,48 @@ const loadDiagnostics: { claude?: string; codex?: string } = {};
 // 避免 settings.json 非原子写入窗口导致单个请求瞬时回退到另一套默认凭据。
 let activeCcSwitchCliPaths: CcSwitchCliPaths | undefined;
 
+let anyrouterProxyAgent: ProxyAgent | undefined;
+let anyrouterProxyAgentUrl: string | undefined;
+
 function ccSwitchCliPaths(): CcSwitchCliPaths {
 	return activeCcSwitchCliPaths ??= resolveCcSwitchCliPaths(homedir());
+}
+
+function configuredAnyrouterProxyUrl(): string | undefined {
+	return resolveAnyrouterProxyUrl(process.env[ANYROUTER_PROXY_ENV]);
+}
+
+function anyrouterProxyAgentFor(proxyUrl: string): ProxyAgent {
+	if (anyrouterProxyAgent && anyrouterProxyAgentUrl === proxyUrl) return anyrouterProxyAgent;
+
+	const staleAgent = anyrouterProxyAgent;
+	anyrouterProxyAgent = new ProxyAgent(proxyUrl);
+	anyrouterProxyAgentUrl = proxyUrl;
+	void staleAgent?.close().catch(() => undefined);
+
+	const displayUrl = new URL(proxyUrl).origin;
+	console.info(`[cc-switch] selective proxy enabled: https://anyrouter.top -> ${displayUrl}`);
+	return anyrouterProxyAgent;
+}
+
+async function fetchCcSwitch(url: string, init?: RequestInit): Promise<Response> {
+	if (!isAnyrouterHttpsUrl(url)) return fetch(url, init);
+
+	const proxyUrl = configuredAnyrouterProxyUrl();
+	if (!proxyUrl) return fetch(url, init);
+
+	const response = await undiciFetch(url, {
+		...init,
+		dispatcher: anyrouterProxyAgentFor(proxyUrl),
+	});
+	return response as unknown as Response;
+}
+
+function cleanupAnyrouterProxy(): void {
+	const agent = anyrouterProxyAgent;
+	anyrouterProxyAgent = undefined;
+	anyrouterProxyAgentUrl = undefined;
+	void agent?.close().catch(() => undefined);
 }
 
 // 中转网关上下文溢出文案归一化模式。pi 只识别少数标准文案才会触发自动 compact 重试，
@@ -404,7 +452,7 @@ async function fetchWithBoundedUpstreamRetry(
 		if (init.signal?.aborted) throw new Error("Request was aborted");
 
 		try {
-			const response = await fetch(url, init);
+			const response = await fetchCcSwitch(url, init);
 			if (!UPSTREAM_RETRY_STATUSES.has(response.status)) return response;
 
 			const body = await safeResponseText(response);
@@ -431,7 +479,7 @@ async function fetchWithBoundedUpstreamRetry(
 	}
 
 	// 循环内已覆盖所有出口，这里只是给 TS 一个兜底。
-	return lastResponse ?? fetch(url, init);
+	return lastResponse ?? fetchCcSwitch(url, init);
 }
 
 async function fetchWithUpstreamRetry(
@@ -448,7 +496,7 @@ async function fetchWithUpstreamRetry(
 		if (init.signal?.aborted) throw new Error("Request was aborted");
 
 		try {
-			const response = await fetch(url, init);
+			const response = await fetchCcSwitch(url, init);
 			if (!FCAPP_ADMISSION_RETRY_STATUSES.has(response.status)) return response;
 
 			const body = await safeResponseText(response);
@@ -555,7 +603,9 @@ function fcappKeepwarmPath(): "/v1/models" | "/healthz" | "/" {
 }
 
 function fcappKeepwarmEndpointsFromRequest(requestUrl: string, mode: FcappKeepwarmMode): FcappKeepwarmEndpoint[] | undefined {
-	if (!isFcappAdmissionRetryEndpoint(requestUrl)) return undefined;
+	const isFcappRequest = isFcappAdmissionRetryEndpoint(requestUrl);
+	const isAnyrouterRequest = isAnyrouterHttpsUrl(requestUrl);
+	if (!isFcappRequest && !isAnyrouterRequest) return undefined;
 	try {
 		const url = new URL(requestUrl);
 		if (mode === "models") {
@@ -565,6 +615,10 @@ function fcappKeepwarmEndpointsFromRequest(requestUrl: string, mode: FcappKeepwa
 		}
 
 		const primaryUrl = url.toString();
+		if (isAnyrouterRequest) {
+			return [{ url: primaryUrl, role: "primary" }];
+		}
+
 		const fallbackUrl = new URL(FCAPP_KEEPWARM_FALLBACK_BASE_URL);
 		fallbackUrl.pathname = url.pathname;
 		fallbackUrl.search = url.search;
@@ -665,7 +719,7 @@ async function requestFcappKeepwarmEndpoint(
 	const timeout = setTimeout(() => controller.abort(), FCAPP_KEEPWARM_TIMEOUT_MS);
 	parentSignal.addEventListener("abort", onParentAbort, { once: true });
 	try {
-		const response = await fetch(url, { ...init, signal: controller.signal });
+		const response = await fetchCcSwitch(url, { ...init, signal: controller.signal });
 		if (!response.ok) {
 			return {
 				ok: false,
@@ -3233,6 +3287,7 @@ export default function (pi: ExtensionAPI) {
 		// Pi 会在 reload、新建/恢复/派生会话时重新加载扩展；必须清理当前实例，避免遗留幽灵保温任务。
 		// 进程级 enabledOverride 不在此处重置，确保当前窗口执行 /fc off 后跨会话重载仍保持关闭。
 		cleanupFcappKeepwarmRuntime();
+		cleanupAnyrouterProxy();
 		fcappKeepwarmStatusSink = undefined;
 	});
 

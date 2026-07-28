@@ -1,12 +1,20 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 
 $prefix = (npm config get prefix).Trim()
+$codexLauncher = Join-Path $prefix "pi-codex-launcher.ps1"
+$codexCommand = @'
+@echo off
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0pi-codex-launcher.ps1" %*
+exit /b %ERRORLEVEL%
+'@
 
-Set-Content -LiteralPath (Join-Path $prefix "pi-codex.cmd") -Encoding ASCII -Value "@echo off`r`npi --provider cc-switch-codex --model current %*`r`n"
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "pi-codex.ps1") -Destination $codexLauncher -Force
+Set-Content -LiteralPath (Join-Path $prefix "pi-codex.cmd") -Encoding ASCII -Value $codexCommand
 Set-Content -LiteralPath (Join-Path $prefix "pi-claude.cmd") -Encoding ASCII -Value "@echo off`r`npi --provider cc-switch-claude --model claude-sonnet-4-5 %*`r`n"
 Set-Content -LiteralPath (Join-Path $prefix "pi-models.cmd") -Encoding ASCII -Value "@echo off`r`npi --list-models cc-switch %*`r`n"
 
 Write-Output "Installed shortcuts:"
 Write-Output (Join-Path $prefix "pi-codex.cmd")
+Write-Output $codexLauncher
 Write-Output (Join-Path $prefix "pi-claude.cmd")
 Write-Output (Join-Path $prefix "pi-models.cmd")
