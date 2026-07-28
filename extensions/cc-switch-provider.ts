@@ -6,6 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { fetch as undiciFetch, ProxyAgent } from "undici";
 
+import * as piAi from "@earendil-works/pi-ai";
 import {
 	CLAUDE_CURRENT_MODEL_ENV,
 	resolveClaudeCurrentModel,
@@ -51,6 +52,16 @@ import {
 	type ToolCall,
 	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
+
+type CompatPiAi = typeof piAi & {
+	registerApiProvider: (provider: {
+		api: Api;
+		stream: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
+		streamSimple: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
+	}) => void;
+};
+
+const { registerApiProvider } = piAi as CompatPiAi;
 
 type AuthKind = "api-key" | "bearer";
 
@@ -3172,6 +3183,13 @@ export default function (pi: ExtensionAPI) {
 	activeCcSwitchCliPaths = resolveCcSwitchCliPaths(homedir());
 	const claude = loadClaudeConfig();
 	if (claude) {
+		const streamClaude = (model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
+			streamCcSwitchAnthropic(claude.authKind, model, context, options);
+		registerApiProvider({
+			api: "cc-switch-anthropic" as Api,
+			stream: streamClaude,
+			streamSimple: streamClaude,
+		});
 		pi.registerProvider("cc-switch-claude", {
 			name: "cc-switch Claude",
 			baseUrl: claude.baseUrl,
@@ -3193,13 +3211,17 @@ export default function (pi: ExtensionAPI) {
 					maxTokens: 64000,
 				};
 			}),
-			streamSimple: (model, context, options) =>
-				streamCcSwitchAnthropic(claude.authKind, model, context, options),
+			streamSimple: streamClaude,
 		});
 	}
 
 	const codex = loadCodexConfig();
 	if (codex?.api === "cc-switch-codex-responses") {
+		registerApiProvider({
+			api: "cc-switch-codex-responses" as Api,
+			stream: streamCcSwitchCodexResponses,
+			streamSimple: streamCcSwitchCodexResponses,
+		});
 		startFcappKeepwarm(endpointForOpenAIResponses(codex.baseUrl), "Codex", codex.apiKey, codex.model);
 	}
 	if (codex) {
