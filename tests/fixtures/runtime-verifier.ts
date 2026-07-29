@@ -25,10 +25,27 @@ const CODEX_SSE = [
 	"",
 ].join("\n");
 
-globalThis.fetch = async (url) => new Response(String(url).includes("claude.test") ? CLAUDE_SSE : CODEX_SSE, {
-	status: 200,
-	headers: { "content-type": "text/event-stream" },
-});
+const requests = [];
+
+globalThis.fetch = async (url, init = {}) => {
+	const headers = new Headers(init.headers);
+	let payload;
+	try {
+		payload = typeof init.body === "string" ? JSON.parse(init.body) : undefined;
+	} catch {
+		payload = undefined;
+	}
+	requests.push({
+		url: String(url),
+		model: payload?.model,
+		authorization: headers.get("authorization"),
+		xApiKey: headers.get("x-api-key"),
+	});
+	return new Response(String(url).includes("claude") ? CLAUDE_SSE : CODEX_SSE, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+};
 
 function text(message) {
 	return message.content.find((block) => block.type === "text")?.text;
@@ -51,6 +68,7 @@ export default function (pi) {
 					codex: Boolean(getApiProvider("cc-switch-codex-responses")),
 				},
 				dispatch: { claude: text(claudeResult), codex: text(codexResult) },
+				requests: requests.splice(0),
 			}), "info");
 		},
 	});

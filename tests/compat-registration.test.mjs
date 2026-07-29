@@ -16,24 +16,43 @@ let stdoutBuffer = "";
 const events = [];
 const waiters = new Set();
 
-function writeTestConfig() {
-	mkdirSync(join(home, ".claude"));
-	mkdirSync(join(home, ".codex"));
+function writeTestConfig(label = "initial") {
+	mkdirSync(join(home, ".claude"), { recursive: true });
+	mkdirSync(join(home, ".codex"), { recursive: true });
+	const suffix = label === "initial" ? "" : `-${label}`;
 	writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({
 		env: {
-			ANTHROPIC_BASE_URL: "https://claude.test",
-			ANTHROPIC_AUTH_TOKEN: "claude-test-key",
-			ANTHROPIC_MODEL: "claude-test-model",
+			ANTHROPIC_BASE_URL: `https://claude${suffix}.test`,
+			ANTHROPIC_AUTH_TOKEN: `claude${suffix}-key`,
+			ANTHROPIC_MODEL: `claude${suffix}-model`,
 		},
 	}));
-	writeFileSync(join(home, ".codex", "auth.json"), JSON.stringify({ OPENAI_API_KEY: "codex-test-key" }));
+	writeFileSync(join(home, ".codex", "auth.json"), JSON.stringify({ OPENAI_API_KEY: `codex${suffix}-key` }));
 	writeFileSync(join(home, ".codex", "config.toml"), [
-		'model = "gpt-test"',
+		`model = "gpt${suffix}"`,
 		'model_provider = "test"',
 		"[model_providers.test]",
-		'base_url = "https://codex.test/v1"',
+		`base_url = "https://codex${suffix}.test/v1"`,
 		'wire_api = "responses"',
 	].join("\n"));
+}
+
+function expectedRequests(label = "initial") {
+	const suffix = label === "initial" ? "" : `-${label}`;
+	return [
+		{
+			url: `https://claude${suffix}.test/v1/messages`,
+			model: `claude${suffix}-model`,
+			authorization: `Bearer claude${suffix}-key`,
+			xApiKey: null,
+		},
+		{
+			url: `https://codex${suffix}.test/v1/responses`,
+			model: `gpt${suffix}`,
+			authorization: `Bearer codex${suffix}-key`,
+			xApiKey: null,
+		},
+	];
 }
 
 function publish(event) {
@@ -117,13 +136,14 @@ after(async () => {
 	rmSync(home, { recursive: true, force: true });
 });
 
-test("direct compat dispatch survives a real Pi reload", async () => {
-	const initial = JSON.parse((await runCommand("initial", "/verify-compat")).message);
-	assert.deepEqual(initial, {
+test("compat dispatch and live/fixed routing survive real Pi reloads", async () => {
+	const expectedBase = {
 		modelRuntime: { claude: "current", codex: "current" },
 		compat: { claude: true, codex: true },
 		dispatch: { claude: "claude-ok", codex: "codex-ok" },
-	});
+	};
+	const initial = JSON.parse((await runCommand("initial", "/verify-compat")).message);
+	assert.deepEqual(initial, { ...expectedBase, requests: expectedRequests() });
 
 	const reset = JSON.parse((await runCommand("reset", "/verify-reset")).message);
 	assert.equal(reset.modelRuntimeStillPresent, true);
@@ -132,5 +152,24 @@ test("direct compat dispatch survives a real Pi reload", async () => {
 
 	await runCommand("reload", "/verify-reload", false);
 	const reloaded = JSON.parse((await runCommand("reloaded", "/verify-compat")).message);
-	assert.deepEqual(reloaded, initial);
+	assert.deepEqual(reloaded, { ...expectedBase, requests: expectedRequests() });
+
+	writeTestConfig("live");
+	const live = JSON.parse((await runCommand("live", "/verify-compat")).message);
+	assert.deepEqual(live, { ...expectedBase, requests: expectedRequests("live") });
+
+	const fixedNotification = await runCommand("fixed-mode", "/cc-switch fixed");
+	assert.match(fixedNotification.message, /已切换为固定快照/);
+	writeTestConfig("after-fixed");
+	const fixed = JSON.parse((await runCommand("fixed", "/verify-compat")).message);
+	assert.deepEqual(fixed, { ...expectedBase, requests: expectedRequests("live") });
+	const fixedStatus = await runCommand("fixed-status", "/cc-switch");
+	assert.match(fixedStatus.message, /中转模式: 固定加载时快照/);
+	assert.match(fixedStatus.message, /https:\/\/claude-live\.test/);
+	assert.doesNotMatch(fixedStatus.message, /after-fixed/);
+
+	const liveNotification = await runCommand("live-mode", "/cc-switch toggle");
+	assert.match(liveNotification.message, /已切换为实时跟随/);
+	const latest = JSON.parse((await runCommand("latest", "/verify-compat")).message);
+	assert.deepEqual(latest, { ...expectedBase, requests: expectedRequests("after-fixed") });
 });

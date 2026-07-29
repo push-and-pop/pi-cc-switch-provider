@@ -39,7 +39,10 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 | `pi --provider cc-switch-codex --model current` | Start Pi with the Codex provider and follow the current model selected in cc-switch. |
 | `pi --provider cc-switch-claude --model current` | Start Pi with the Claude provider and follow the current model selected in cc-switch. |
 | `pi --provider cc-switch-claude --model mimo-v2.5-pro` | Start Pi with a concrete Claude model imported from cc-switch. Replace it with the one shown by `pi --list-models cc-switch`. |
-| `/cc-switch` | Show the import status of cc-switch Codex and Claude providers inside Pi. |
+| `/cc-switch` | Show the active routing mode and imported Codex/Claude provider status. |
+| `/cc-switch live` | Follow the current cc-switch route, credential, model, and reasoning settings on every request. |
+| `/cc-switch fixed` | Freeze Codex and Claude to the configuration snapshot captured during extension reload. |
+| `/cc-switch toggle` | Toggle between live and fixed routing, then reload the extension automatically. |
 | `/model` | Pi built-in command for selecting or switching models inside Pi. |
 
 Examples:
@@ -56,8 +59,16 @@ Inside Pi:
 
 ```text
 /cc-switch
+/cc-switch fixed
+/cc-switch live
 /model
 ```
+
+### Routing Modes
+
+Routing defaults to `live` to preserve the existing behavior. In this mode every Codex Responses and Claude request reads the current cc-switch output files and uses one coherent set of route, credential, model, reasoning, and authentication settings.
+
+`fixed` captures the complete Codex and Claude configuration when the extension loads. Later cc-switch changes do not affect requests, the footer, status output, or keepwarm routing until Pi restarts or `/reload` runs. `/cc-switch live`, `/cc-switch fixed`, and `/cc-switch toggle` persist only `routingMode` in `%USERPROFILE%\.pi\agent\cc-switch-provider.json` and automatically reload the extension; API keys remain in memory and are never copied into that file. Existing `codexSummary` and unknown extension fields are preserved.
 
 ### Pi Built-in CLI Commands
 
@@ -238,7 +249,7 @@ $env:NODE_USE_ENV_PROXY = "1"
 
 ### Claude Models
 
-The extension registers `cc-switch-claude/current`, which re-reads the active Claude settings file before each request and follows the current model selected in cc-switch. It also registers the concrete model currently written by cc-switch, such as `mimo-v2.5-pro`.
+The extension registers `cc-switch-claude/current`. In `live` routing mode it re-reads the active Claude settings before each request and follows the route and model selected in cc-switch; in `fixed` mode it uses the snapshot captured at extension load. It also registers the concrete model currently written by cc-switch, such as `mimo-v2.5-pro`.
 
 On top of those, a fixed set is always registered: `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, `claude-sonnet-4-6`. All of them are 1M-context models, so the extension enables the 1M beta and the `xhigh` thinking level for them. Your relay still has to have the corresponding channel enabled; fall back to an older model if one of them keeps failing.
 
@@ -250,7 +261,7 @@ To add extra fixed models, set `PI_CC_SWITCH_CLAUDE_MODELS` in cc-switch's Claud
 
 ### Codex Models
 
-The extension registers `cc-switch-codex/current`, which re-reads the active Codex `config.toml` before each request and follows the current model selected in cc-switch.
+The extension registers `cc-switch-codex/current`. In `live` routing mode Responses requests re-read the active Codex configuration before each request and follow the current cc-switch route, credential, model, and reasoning effort; in `fixed` mode they use the snapshot captured at extension load.
 
 At startup or `/reload`, when the top-level `model_catalog_json` points to the CC Switch-owned filename `cc-switch-model-catalog.json`, the extension imports the catalog's validated model IDs, display names, context windows, reasoning flag, and input modalities. A valid non-empty catalog replaces the fixed Codex list. If the pointer is absent, user-owned, missing, oversized, malformed, or empty, the extension preserves the legacy fallback: the concrete current model plus `gpt-5.5` and `gpt-5.6-sol`.
 
@@ -346,7 +357,10 @@ pi install git:github.com/Ginkgoooo/pi-cc-switch-provider
 | `pi --provider cc-switch-codex --model current` | 使用 cc-switch 导入的 Codex provider，并跟随 cc-switch 当前选择的模型。 |
 | `pi --provider cc-switch-claude --model current` | 使用 cc-switch 导入的 Claude provider，并跟随 cc-switch 当前选择的模型。 |
 | `pi --provider cc-switch-claude --model mimo-v2.5-pro` | 使用 cc-switch 导入的 Claude provider 和具体模型启动 Pi。可替换为 `pi --list-models cc-switch` 显示的模型。 |
-| `/cc-switch` | 在 Pi 内查看 cc-switch Codex 和 Claude provider 的导入状态。 |
+| `/cc-switch` | 在 Pi 内查看当前中转模式及 Codex、Claude provider 导入状态。 |
+| `/cc-switch live` | 每次请求实时跟随 cc-switch 当前中转、凭据、模型和 reasoning 配置。 |
+| `/cc-switch fixed` | 将 Codex、Claude 固定为扩展 reload 时捕获的完整配置快照。 |
+| `/cc-switch toggle` | 在实时与固定模式间切换，并自动 reload 扩展。 |
 | `/model` | Pi 内置命令，用于在 Pi 内选择或切换模型。 |
 
 示例：
@@ -363,8 +377,16 @@ pi --provider cc-switch-claude --model mimo-v2.5-pro
 
 ```text
 /cc-switch
+/cc-switch fixed
+/cc-switch live
 /model
 ```
+
+### 中转模式
+
+默认使用 `live` 实时跟随模式，以保持原有行为。该模式会在每次 Codex Responses 和 Claude 请求前读取 cc-switch 当前输出文件，并从同一份配置中取得中转地址、凭据、模型、reasoning 和鉴权方式。
+
+`fixed` 固定模式会在扩展加载时捕获 Codex、Claude 的完整配置快照。此后 cc-switch 的切换不会影响请求、页脚、状态输出和保温路由，直到重启 Pi 或执行 `/reload`。`/cc-switch live`、`/cc-switch fixed`、`/cc-switch toggle` 只会将 `routingMode` 持久化到 `%USERPROFILE%\.pi\agent\cc-switch-provider.json`，随后自动 reload 扩展；API Key 只保留在内存中，不会复制到该文件。已有 `codexSummary` 和未知扩展字段会原样保留。
 
 ### Pi 内置 CLI 命令
 
@@ -545,7 +567,7 @@ $env:NODE_USE_ENV_PROXY = "1"
 
 ### Claude 模型
 
-该扩展会注册 `cc-switch-claude/current`，并在每次请求前重新读取当前生效的 Claude settings 文件，跟随 cc-switch 当前选择的模型。它也会注册 cc-switch 当前写入的具体模型，例如 `mimo-v2.5-pro`。
+该扩展会注册 `cc-switch-claude/current`。在 `live` 模式下，每次请求前都会重新读取当前 Claude settings，跟随 cc-switch 选择的中转和模型；在 `fixed` 模式下，则使用扩展加载时捕获的快照。它也会注册 cc-switch 当前写入的具体模型，例如 `mimo-v2.5-pro`。
 
 在此之外，扩展还会固定注册一组可切换模型：`claude-fable-5`、`claude-opus-5`、`claude-opus-4-8`、`claude-opus-4-7`、`claude-opus-4-6`、`claude-sonnet-5`、`claude-sonnet-4-6`。它们都是 1M 上下文模型，扩展会为其开启 1M beta 和 `xhigh` 思考档位。能否真正调用仍取决于中转是否开通对应渠道，某个模型持续失败就换旧版本。
 
@@ -561,7 +583,7 @@ $env:NODE_USE_ENV_PROXY = "1"
 
 ### Codex 模型
 
-该扩展会注册 `cc-switch-codex/current`，并在每次请求前重新读取当前生效的 Codex `config.toml`，跟随 cc-switch 当前选择的模型。
+该扩展会注册 `cc-switch-codex/current`。在 `live` 模式下，Responses 请求会在每次调用前读取 Codex 当前配置，跟随 cc-switch 当前中转、凭据、模型和 reasoning effort；在 `fixed` 模式下，则使用扩展加载时捕获的快照。
 
 启动或执行 `/reload` 时，如果顶层 `model_catalog_json` 指向 CC Switch 所有的文件名 `cc-switch-model-catalog.json`，扩展会导入 catalog 中通过校验的模型 ID、显示名、上下文窗口、reasoning 标记和输入模态。有效且非空的 catalog 会替代固定 Codex 列表；如果指针缺失、属于用户自定义文件、文件不存在、过大、格式错误或为空，则保留旧回退列表：当前具体模型以及 `gpt-5.5`、`gpt-5.6-sol`。
 

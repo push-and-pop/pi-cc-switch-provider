@@ -18,6 +18,12 @@ import {
 } from "../lib/cc-switch-config-paths.ts";
 
 import {
+	FCAPP_ADMISSION_RETRY_HOST,
+	isFcappAdmissionRetryEndpoint,
+	requiresIndependentCodexSummaryRoute,
+} from "../lib/codex-summary-routing.ts";
+
+import {
 	buildCodexModelIds,
 	clampCodexContextWindow,
 	type CodexCatalogModel,
@@ -26,6 +32,12 @@ import {
 	loadOwnedCodexModelCatalog,
 	resolveCodexRequestModelId,
 } from "../lib/codex-model-catalog.ts";
+
+import {
+	type CcSwitchRoutingMode,
+	readCcSwitchProviderLocalConfig,
+	writeCcSwitchRoutingMode,
+} from "../lib/provider-local-config.ts";
 
 import {
 	ANYROUTER_PROXY_ENV,
@@ -83,9 +95,12 @@ interface CodexConfig {
 	catalogStatus: CodexCatalogStatus;
 }
 
-interface CcSwitchProviderLocalConfig {
-	codexSummary?: {
-		baseUrl?: string;
+interface ProviderRoutingSnapshot {
+	claude?: ClaudeConfig;
+	codex?: CodexConfig;
+	diagnostics: {
+		claude?: string;
+		codex?: string;
 	};
 }
 
@@ -118,6 +133,7 @@ const CODEX_CONTEXT_WINDOW_ENV = "PI_CC_SWITCH_CODEX_CONTEXT_WINDOW";
 const CODEX_SUMMARY_BASE_URL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_BASE_URL";
 const DEFAULT_CODEX_SUMMARY_BASE_URL = "https://paid.tribiosapi.top/v1";
 const CC_SWITCH_PROVIDER_CONFIG_FILE = "cc-switch-provider.json";
+const CC_SWITCH_ROUTING_STATUS_KEY = "cc-switch-routing-mode";
 const CODEX_SUMMARY_MODEL_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_MODEL";
 const CODEX_SUMMARY_API_KEY_ENV = "PI_CC_SWITCH_CODEX_SUMMARY_API_KEY";
 const CURRENT_CODEX_MODEL_ID = "current";
@@ -143,7 +159,6 @@ const CLAUDE_CODE_BETAS = [
 	"interleaved-thinking-2025-05-14",
 	"effort-2025-11-24",
 ];
-const FCAPP_ADMISSION_RETRY_HOST = "a-ocnfniawgw.cn-shanghai.fcapp.run";
 const FCAPP_KEEPWARM_FALLBACK_BASE_URL = "https://anyrouter.top";
 const FCAPP_ADMISSION_RETRY_BASE_DELAY_MS = 1000;
 const FCAPP_ADMISSION_RETRY_MAX_DELAY_MS = 15000;
@@ -325,14 +340,6 @@ function positiveIntegerEnv(name: string): number | undefined {
 	if (Number.isFinite(value) && value > 0) return value;
 	console.warn(`[cc-switch] Ignore invalid ${name}=${raw}; expected a positive integer`);
 	return undefined;
-}
-
-function isFcappAdmissionRetryEndpoint(url: string): boolean {
-	try {
-		return new URL(url).hostname.toLowerCase() === FCAPP_ADMISSION_RETRY_HOST;
-	} catch {
-		return url.toLowerCase().includes(FCAPP_ADMISSION_RETRY_HOST);
-	}
 }
 
 function fcappAdmissionRetryDelayMs(attempt: number): number {
@@ -1255,6 +1262,15 @@ function sameCodexFooterConfig(left: CodexFooterConfig, right: CodexFooterConfig
 		left.modelReasoningEffort === right.modelReasoningEffort;
 }
 
+function codexFooterConfigFromSnapshot(codex: CodexConfig | undefined): CodexFooterConfig {
+	if (!codex) return {};
+	return {
+		api: codex.api,
+		model: codex.model,
+		modelReasoningEffort: codex.modelReasoningEffort,
+	};
+}
+
 function formatFooterTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -1284,25 +1300,33 @@ function sanitizeFooterStatusText(text: string): string {
  * Pi 内置页脚固定显示 session thinkingLevel，无法反映 gpt-5.6-sol 最终直传的
  * model_reasoning_effort。这里保留原页脚信息，只把 Codex 模型和档位替换为实际请求值。
  */
-function installCcSwitchFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
+function installCcSwitchFooter(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	routingMode: CcSwitchRoutingMode,
+	codexSnapshot: CodexConfig | undefined,
+): void {
 	if (!ctx.hasUI) return;
 	const configPath = ccSwitchCliPaths().codexConfigPath;
+	const readsLiveCodexConfig = routingMode === "live";
 
 	ctx.ui.setFooter((tui, theme, footerData) => {
-		let codexConfig = readCodexFooterConfig(configPath);
+		let codexConfig = readsLiveCodexConfig
+			? readCodexFooterConfig(configPath)
+			: codexFooterConfigFromSnapshot(codexSnapshot);
 		const onConfigChange = () => {
 			const nextConfig = readCodexFooterConfig(configPath);
 			if (sameCodexFooterConfig(codexConfig, nextConfig)) return;
 			codexConfig = nextConfig;
 			tui.requestRender();
 		};
-		watchFile(configPath, { interval: 500 }, onConfigChange);
+		if (readsLiveCodexConfig) watchFile(configPath, { interval: 500 }, onConfigChange);
 		const unsubscribeBranch = footerData.onBranchChange(() => tui.requestRender());
 
 		return {
 			dispose(): void {
 				unsubscribeBranch();
-				unwatchFile(configPath, onConfigChange);
+				if (readsLiveCodexConfig) unwatchFile(configPath, onConfigChange);
 			},
 			invalidate(): void {},
 			render(width: number): string[] {
@@ -1357,13 +1381,13 @@ function installCcSwitchFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 				}
 
 				const model = ctx.model;
-				const followsLiveCodex = model?.provider === "cc-switch-codex" &&
+				const resolvesCurrentCodex = model?.provider === "cc-switch-codex" &&
 					isCurrentCodexModel(model.id) &&
 					codexConfig.api === "cc-switch-codex-responses" && Boolean(codexConfig.model);
-				const modelName = followsLiveCodex ? (codexConfig.model as string) : (model?.id ?? "no-model");
+				const modelName = resolvesCurrentCodex ? (codexConfig.model as string) : (model?.id ?? "no-model");
 				let rightSideWithoutProvider = modelName;
 				if (model?.reasoning) {
-					const configuredEffort = followsLiveCodex && modelName === CODEX_CONFIG_REASONING_MODEL
+					const configuredEffort = resolvesCurrentCodex && modelName === CODEX_CONFIG_REASONING_MODEL
 						? codexConfig.modelReasoningEffort
 						: undefined;
 					const thinkingLevel = pi.getThinkingLevel() || "off";
@@ -1469,22 +1493,25 @@ function ccSwitchProviderConfigPath(): string {
 	return join(homedir(), ".pi", "agent", CC_SWITCH_PROVIDER_CONFIG_FILE);
 }
 
-function loadCcSwitchProviderLocalConfig(): CcSwitchProviderLocalConfig | undefined {
-	const configPath = ccSwitchProviderConfigPath();
-	if (!existsSync(configPath)) return undefined;
-	const config = readJsonObject(configPath);
-	if (!config) {
-		throw new Error(`独立压缩中转配置文件不是有效的 JSON 对象：${configPath}`);
-	}
-	if (config.codexSummary !== undefined && !isRecord(config.codexSummary)) {
-		throw new Error(`独立压缩中转配置 codexSummary 必须是 JSON 对象：${configPath}`);
-	}
-	const codexSummary = isRecord(config.codexSummary) ? config.codexSummary : undefined;
-	return {
-		codexSummary: codexSummary
-			? { baseUrl: stringValue(codexSummary.baseUrl) }
-			: undefined,
-	};
+type CcSwitchRoutingCommandAction = CcSwitchRoutingMode | "toggle" | "status";
+
+function parseCcSwitchRoutingCommandAction(args: string | undefined): CcSwitchRoutingCommandAction | undefined {
+	const value = args?.trim().toLowerCase();
+	if (!value || /^(status|stat|s|状态|查看)$/.test(value)) return "status";
+	if (/^(live|follow|realtime|on|实时|跟随|开启)$/.test(value)) return "live";
+	if (/^(fixed|freeze|snapshot|off|固定|冻结|关闭)$/.test(value)) return "fixed";
+	if (/^(toggle|t|切换)$/.test(value)) return "toggle";
+	return undefined;
+}
+
+function routingModeStatusLine(routingMode: CcSwitchRoutingMode): string {
+	return routingMode === "live"
+		? "中转模式: 实时跟随 cc-switch（每次请求读取）"
+		: "中转模式: 固定加载时快照（重启或 /reload 更新）";
+}
+
+function routingModeFooterStatus(routingMode: CcSwitchRoutingMode): string {
+	return routingMode === "live" ? "中转: 实时跟随" : "中转: 固定快照";
 }
 
 function validateCodexSummaryBaseUrl(baseUrl: string): string {
@@ -1501,7 +1528,7 @@ function codexSummaryBaseUrlConfig(): Pick<CodexSummaryRoute, "baseUrl" | "sourc
 	const envBaseUrl = process.env[CODEX_SUMMARY_BASE_URL_ENV]?.trim();
 	if (envBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(envBaseUrl), source: "env" };
 
-	const fileBaseUrl = loadCcSwitchProviderLocalConfig()?.codexSummary?.baseUrl;
+	const fileBaseUrl = readCcSwitchProviderLocalConfig(ccSwitchProviderConfigPath()).codexSummary?.baseUrl;
 	if (fileBaseUrl) return { baseUrl: validateCodexSummaryBaseUrl(fileBaseUrl), source: "config" };
 
 	return { baseUrl: DEFAULT_CODEX_SUMMARY_BASE_URL, source: "default" };
@@ -1525,13 +1552,13 @@ function resolveIndependentCodexSummaryRoute(): CodexSummaryRoute {
 }
 
 function codexSummaryRouteStatus(codex: CodexConfig): string {
-	if (!isFcappAdmissionRetryEndpoint(codex.baseUrl)) {
+	if (!requiresIndependentCodexSummaryRoute(codex.baseUrl)) {
 		return `Codex Summary: 跟随当前中转 ${codex.baseUrl}`;
 	}
 	try {
 		const route = resolveIndependentCodexSummaryRoute();
 		const sourceLabel = route.source === "env" ? "环境变量" : route.source === "config" ? "配置文件" : "默认配置";
-		return `Codex Summary: ${route.model} -> ${route.baseUrl} [FC 独立压缩/${sourceLabel}]`;
+		return `Codex Summary: ${route.model} -> ${route.baseUrl} [独立压缩/${sourceLabel}]`;
 	} catch (error) {
 		return `Codex Summary: 配置错误 ${error instanceof Error ? error.message : String(error)}`;
 	}
@@ -1572,6 +1599,24 @@ function loadCodexConfig(): CodexConfig | undefined {
 	}
 	loadDiagnostics.codex = undefined;
 	return result.config;
+}
+
+function captureProviderRoutingSnapshot(): ProviderRoutingSnapshot {
+	const claude = loadClaudeConfig();
+	const codex = loadCodexConfig();
+	return {
+		claude,
+		codex,
+		diagnostics: {
+			claude: loadDiagnostics.claude,
+			codex: loadDiagnostics.codex,
+		},
+	};
+}
+
+function applyProviderRoutingDiagnostics(snapshot: ProviderRoutingSnapshot): void {
+	loadDiagnostics.claude = snapshot.diagnostics.claude;
+	loadDiagnostics.codex = snapshot.diagnostics.codex;
 }
 
 function endpointForAnthropicMessages(baseUrl: string): string {
@@ -1622,10 +1667,12 @@ function isCurrentCodexModel(modelId: string): boolean {
 }
 
 function resolveRuntimeClaudeModel(model: Model<Api>, liveConfig?: ClaudeConfig): Model<Api> {
+	if (!liveConfig) return model;
 	if (!isCurrentClaudeModel(model.id)) {
-		return model;
+		// 具体模型保持用户选择的模型 ID，但中转地址、凭据和鉴权方式必须来自同一份运行时配置。
+		return { ...model, baseUrl: liveConfig.baseUrl };
 	}
-	if (!liveConfig?.currentModel) {
+	if (!liveConfig.currentModel) {
 		throw new Error(
 			`cc-switch Claude current model is not set in the configured Claude settings file; set ${CLAUDE_CURRENT_MODEL_ENV} or select a concrete model`,
 		);
@@ -2918,6 +2965,7 @@ async function processOpenAIResponsesSse(
 }
 
 function streamCcSwitchCodexResponses(
+	resolveCodexConfig: () => CodexConfig | undefined,
 	model: Model<Api>,
 	context: Context,
 	options?: SimpleStreamOptions,
@@ -2925,14 +2973,13 @@ function streamCcSwitchCodexResponses(
 	const stream = createAssistantMessageEventStream();
 
 	(async () => {
-		const liveCodex = loadCodexConfig();
-		const runtimeModel = resolveRuntimeCodexModel(model, liveCodex);
+		let runtimeModel = model;
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
-			api: runtimeModel.api,
-			provider: runtimeModel.provider,
-			model: runtimeModel.id,
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
 			usage: {
 				input: 0,
 				output: 0,
@@ -2946,17 +2993,28 @@ function streamCcSwitchCodexResponses(
 		};
 
 		try {
-			const apiKey = resolveRuntimeCodexApiKey(options, liveCodex);
+			const routingCodex = resolveCodexConfig();
+			if (!routingCodex) {
+				throw new Error("cc-switch Codex configuration is unavailable; restore the active config or run /reload");
+			}
+			if (routingCodex.api !== "cc-switch-codex-responses") {
+				throw new Error("cc-switch Codex wire_api changed; run /reload to re-register the active API");
+			}
+			runtimeModel = resolveRuntimeCodexModel(model, routingCodex);
+			output.api = runtimeModel.api;
+			output.model = runtimeModel.id;
+			const apiKey = resolveRuntimeCodexApiKey(options, routingCodex);
 			if (!apiKey) throw new Error("Missing cc-switch Codex credential");
 
-			const useIndependentSummaryRoute = isSummarizationContext(context) && isFcappAdmissionRetryEndpoint(runtimeModel.baseUrl);
+			const useIndependentSummaryRoute = isSummarizationContext(context) &&
+				requiresIndependentCodexSummaryRoute(runtimeModel.baseUrl);
 			const summaryRoute = useIndependentSummaryRoute ? resolveIndependentCodexSummaryRoute() : undefined;
 			const requestBaseUrl = summaryRoute?.baseUrl ?? runtimeModel.baseUrl;
 			const requestApiKey = summaryRoute?.apiKey ?? apiKey;
 			const requestModelId = summaryRoute?.model ?? runtimeModel.id;
-			const runtimeReasoningEffort = liveCodex &&
-				(isCurrentCodexModel(model.id) || model.id === liveCodex.model)
-				? liveCodex.modelReasoningEffort
+			const runtimeReasoningEffort = routingCodex &&
+				(isCurrentCodexModel(model.id) || model.id === routingCodex.model)
+				? routingCodex.modelReasoningEffort
 				: undefined;
 			const primaryPayload = buildOpenAIResponsesPayload(runtimeModel, context, options, runtimeReasoningEffort);
 			const payload = requestModelId === runtimeModel.id ? primaryPayload : { ...primaryPayload, model: requestModelId };
@@ -2967,7 +3025,7 @@ function streamCcSwitchCodexResponses(
 			};
 
 			const endpoint = endpointForOpenAIResponses(requestBaseUrl);
-			const route = summaryRoute ? "fc-independent-summary" : "primary";
+			const route = summaryRoute ? "independent-summary" : "primary";
 			writeDebugRequest(headers, payload, context, { route, endpoint, primaryEndpoint: summaryRoute ? endpointForOpenAIResponses(runtimeModel.baseUrl) : undefined });
 			const response = await fetchWithUpstreamRetry(endpoint, {
 				method: "POST",
@@ -3024,6 +3082,7 @@ function streamCcSwitchCodexResponses(
 }
 
 function streamCcSwitchAnthropic(
+	resolveClaudeConfig: () => ClaudeConfig | undefined,
 	authKind: AuthKind,
 	model: Model<Api>,
 	context: Context,
@@ -3051,10 +3110,13 @@ function streamCcSwitchAnthropic(
 		};
 
 		try {
-			const liveClaude = loadClaudeConfig();
-			const runtimeModel = resolveRuntimeClaudeModel(model, liveClaude);
+			const routingClaude = resolveClaudeConfig();
+			if (!routingClaude) {
+				throw new Error("cc-switch Claude configuration is unavailable; restore the active config or run /reload");
+			}
+			const runtimeModel = resolveRuntimeClaudeModel(model, routingClaude);
 			output.model = runtimeModel.id;
-			const apiKey = liveClaude?.apiKey ?? options?.apiKey;
+			const apiKey = routingClaude?.apiKey ?? options?.apiKey;
 			if (!apiKey) throw new Error("Missing cc-switch Claude credential");
 
 			const sessionId = claudeSessionId(options);
@@ -3080,7 +3142,7 @@ function streamCcSwitchAnthropic(
 			if (betaHeader) {
 				headers["anthropic-beta"] = betaHeader;
 			}
-			const runtimeAuthKind = liveClaude?.authKind ?? authKind;
+			const runtimeAuthKind = routingClaude?.authKind ?? authKind;
 			if (runtimeAuthKind === "bearer") {
 				headers.Authorization = `Bearer ${apiKey}`;
 			} else {
@@ -3179,12 +3241,25 @@ function streamCcSwitchAnthropic(
 }
 
 export default function (pi: ExtensionAPI) {
-	// Re-evaluate device-local directory overrides for every extension load/reload.
+	// Re-evaluate device-local directory overrides and capture one coherent registration snapshot on every load/reload.
 	activeCcSwitchCliPaths = resolveCcSwitchCliPaths(homedir());
-	const claude = loadClaudeConfig();
+	const localConfigPath = ccSwitchProviderConfigPath();
+	const routingMode = readCcSwitchProviderLocalConfig(localConfigPath).routingMode;
+	const routingSnapshot = captureProviderRoutingSnapshot();
+	applyProviderRoutingDiagnostics(routingSnapshot);
+
+	const resolveClaudeConfig = routingMode === "live"
+		? () => loadClaudeConfig()
+		: () => routingSnapshot.claude;
+	const resolveCodexConfig = routingMode === "live"
+		? () => loadCodexConfig()
+		: () => routingSnapshot.codex;
+	const claude = routingSnapshot.claude;
+	const codex = routingSnapshot.codex;
+
 	if (claude) {
 		const streamClaude = (model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
-			streamCcSwitchAnthropic(claude.authKind, model, context, options);
+			streamCcSwitchAnthropic(resolveClaudeConfig, claude.authKind, model, context, options);
 		registerApiProvider({
 			api: "cc-switch-anthropic" as Api,
 			stream: streamClaude,
@@ -3215,12 +3290,13 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	const codex = loadCodexConfig();
 	if (codex?.api === "cc-switch-codex-responses") {
+		const streamCodex = (model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
+			streamCcSwitchCodexResponses(resolveCodexConfig, model, context, options);
 		registerApiProvider({
 			api: "cc-switch-codex-responses" as Api,
-			stream: streamCcSwitchCodexResponses,
-			streamSimple: streamCcSwitchCodexResponses,
+			stream: streamCodex,
+			streamSimple: streamCodex,
 		});
 		startFcappKeepwarm(endpointForOpenAIResponses(codex.baseUrl), "Codex", codex.apiKey, codex.model);
 	}
@@ -3249,27 +3325,73 @@ export default function (pi: ExtensionAPI) {
 				};
 			}),
 			...(codex.api === "cc-switch-codex-responses"
-				? { streamSimple: (model, context, options) => streamCcSwitchCodexResponses(model, context, options) }
+				? {
+					streamSimple: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
+						streamCcSwitchCodexResponses(resolveCodexConfig, model, context, options),
+				}
 				: {}),
 		});
 	}
 
+	const providerStatusLines = (): string[] => {
+		const effectiveSnapshot = routingMode === "live" ? captureProviderRoutingSnapshot() : routingSnapshot;
+		const effectiveClaude = effectiveSnapshot.claude;
+		const effectiveCodex = effectiveSnapshot.codex;
+		return [
+			routingModeStatusLine(routingMode),
+			effectiveClaude
+				? `Claude: current=${effectiveClaude.currentModel ?? "unknown"}; models=${effectiveClaude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${effectiveClaude.baseUrl}`
+				: effectiveSnapshot.diagnostics.claude ?? "Claude: no configured settings provider found",
+			effectiveCodex
+				? `Codex: cc-switch-codex/${effectiveCodex.model} -> ${effectiveCodex.baseUrl}; catalog=${effectiveCodex.catalogStatus === "loaded" ? `cc-switch/${effectiveCodex.catalogModels.length}` : `fallback/${effectiveCodex.catalogStatus}`}`
+				: effectiveSnapshot.diagnostics.codex ?? "Codex: no configured provider found",
+			effectiveCodex ? codexSummaryRouteStatus(effectiveCodex) : "Codex Summary: unavailable",
+			fcappKeepwarmStatusLine(),
+		];
+	};
+
 	pi.registerCommand("cc-switch", {
-		description: "Show cc-switch provider import status",
-		handler: (_args, ctx) => {
-			const liveClaude = loadClaudeConfig() ?? claude;
-			const liveCodex = loadCodexConfig() ?? codex;
-			const lines = [
-				liveClaude
-					? `Claude: current=${liveClaude.currentModel ?? "unknown"}; models=${liveClaude.models.map((model) => `cc-switch-claude/${model}`).join(", ")} -> ${liveClaude.baseUrl}`
-					: loadDiagnostics.claude ?? "Claude: no configured settings provider found",
-				liveCodex
-					? `Codex: cc-switch-codex/${liveCodex.model} -> ${liveCodex.baseUrl}; catalog=${liveCodex.catalogStatus === "loaded" ? `cc-switch/${liveCodex.catalogModels.length}` : `fallback/${liveCodex.catalogStatus}`}`
-					: loadDiagnostics.codex ?? "Codex: no configured provider found",
-				liveCodex ? codexSummaryRouteStatus(liveCodex) : "Codex Summary: unavailable",
-				fcappKeepwarmStatusLine(),
+		description: "Show or change cc-switch routing mode (/cc-switch live|fixed|toggle)",
+		getArgumentCompletions: (prefix) => {
+			const items = [
+				{ value: "live", label: "live", description: "每次请求实时读取 cc-switch 配置" },
+				{ value: "fixed", label: "fixed", description: "固定扩展加载时捕获的配置快照" },
+				{ value: "toggle", label: "toggle", description: "切换实时/固定模式" },
+				{ value: "status", label: "status", description: "查看当前模式和 Provider 状态" },
 			];
-			ctx.ui.notify(lines.join("\n"), "info");
+			const normalizedPrefix = prefix.trim().toLowerCase();
+			const filtered = items.filter((item) => item.value.startsWith(normalizedPrefix));
+			return filtered.length > 0 ? filtered : null;
+		},
+		handler: async (args, ctx) => {
+			const action = parseCcSwitchRoutingCommandAction(args);
+			if (!action) {
+				ctx.ui.notify("用法：/cc-switch /cc-switch live /cc-switch fixed /cc-switch toggle", "warning");
+				return;
+			}
+			if (action === "status") {
+				ctx.ui.notify(providerStatusLines().join("\n"), "info");
+				return;
+			}
+
+			const nextMode = action === "toggle"
+				? (routingMode === "live" ? "fixed" : "live")
+				: action;
+			if (nextMode === routingMode) {
+				ctx.ui.notify(`当前已是${routingMode === "live" ? "实时跟随" : "固定快照"}模式。\n${routingModeStatusLine(routingMode)}`, "info");
+				return;
+			}
+
+			await ctx.waitForIdle();
+			try {
+				writeCcSwitchRoutingMode(localConfigPath, nextMode);
+			} catch (error) {
+				ctx.ui.notify(`切换中转模式失败：${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+			ctx.ui.notify(`中转模式已切换为${nextMode === "live" ? "实时跟随" : "固定快照"}，正在重新加载扩展。`, "info");
+			await ctx.reload();
+			return;
 		},
 	});
 
@@ -3314,7 +3436,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		installCcSwitchFooter(pi, ctx);
+		installCcSwitchFooter(pi, ctx, routingMode, routingSnapshot.codex);
+		ctx.ui.setStatus(CC_SWITCH_ROUTING_STATUS_KEY, routingModeFooterStatus(routingMode));
 		fcappKeepwarmStatusSink = (text) => ctx.ui.setStatus(FCAPP_KEEPWARM_STATUS_KEY, text);
 		fcappKeepwarmStatusSink(fcappKeepwarmStatusText);
 	});
