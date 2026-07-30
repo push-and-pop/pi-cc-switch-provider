@@ -1,6 +1,9 @@
 export const ANYROUTER_HOST = "anyrouter.top";
+export const AGENTROUTER_HOST = "agentrouter.org";
 export const ANYROUTER_PROXY_ENV = "PI_CC_SWITCH_ANYROUTER_PROXY";
 export const DEFAULT_ANYROUTER_PROXY_URL = "http://127.0.0.1:7897";
+
+const SELECTIVE_PROXY_HOSTS = new Set([ANYROUTER_HOST, AGENTROUTER_HOST]);
 
 const DISABLED_ANYROUTER_PROXY_VALUES = new Set(["0", "false", "no", "off", "direct"]);
 
@@ -8,6 +11,15 @@ export function isAnyrouterHttpsUrl(value: string): boolean {
 	try {
 		const url = new URL(value);
 		return url.protocol === "https:" && url.hostname.toLowerCase() === ANYROUTER_HOST;
+	} catch {
+		return false;
+	}
+}
+
+export function isSelectiveProxyHttpsUrl(value: string): boolean {
+	try {
+		const url = new URL(value);
+		return url.protocol === "https:" && SELECTIVE_PROXY_HOSTS.has(url.hostname.toLowerCase());
 	} catch {
 		return false;
 	}

@@ -6,8 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$AnyrouterBaseHost = "anyrouter.top"
-$AnyrouterBasePath = "/v1"
+$SelectiveProxyBaseHosts = @("anyrouter.top", "agentrouter.org")
+$SelectiveProxyBasePath = "/v1"
 $DefaultAnyrouterProxy = "http://127.0.0.1:7897"
 $AnyrouterProxyEnv = "PI_CC_SWITCH_ANYROUTER_PROXY"
 $GlobalProxyEnvNames = @(
@@ -153,7 +153,7 @@ function Get-ActiveCodexBaseUrl {
 	}
 }
 
-function Test-AnyrouterV1BaseUrl {
+function Test-SelectiveProxyV1BaseUrl {
 	param([AllowNull()][string]$BaseUrl)
 
 	if ([string]::IsNullOrWhiteSpace($BaseUrl)) { return $false }
@@ -162,9 +162,9 @@ function Test-AnyrouterV1BaseUrl {
 		if (-not $uri.IsAbsoluteUri) { return $false }
 		$path = $uri.AbsolutePath.TrimEnd('/')
 		return $uri.Scheme -eq "https" `
-			-and $uri.Host -ieq $AnyrouterBaseHost `
+			-and $SelectiveProxyBaseHosts -icontains $uri.Host `
 			-and ($uri.IsDefaultPort -or $uri.Port -eq 443) `
-			-and $path -ceq $AnyrouterBasePath `
+			-and $path -ceq $SelectiveProxyBasePath `
 			-and [string]::IsNullOrEmpty($uri.Query) `
 			-and [string]::IsNullOrEmpty($uri.Fragment)
 	} catch {
@@ -174,7 +174,7 @@ function Test-AnyrouterV1BaseUrl {
 
 $configPath = Resolve-CodexConfigPath
 $baseUrl = Get-ActiveCodexBaseUrl $configPath
-$useSelectiveProxy = Test-AnyrouterV1BaseUrl $baseUrl
+$useSelectiveProxy = Test-SelectiveProxyV1BaseUrl $baseUrl
 
 if ($useSelectiveProxy) {
 	foreach ($name in $GlobalProxyEnvNames) {
@@ -183,7 +183,7 @@ if ($useSelectiveProxy) {
 	$proxyUrl = [Environment]::GetEnvironmentVariable($AnyrouterProxyEnv, "Process")
 	if ([string]::IsNullOrWhiteSpace($proxyUrl)) { $proxyUrl = $DefaultAnyrouterProxy }
 	Set-Item -LiteralPath "Env:$AnyrouterProxyEnv" -Value $proxyUrl
-	Write-Host "[pi-codex] https://anyrouter.top/v1 detected; selective proxy enabled."
+	Write-Host "[pi-codex] $baseUrl detected; selective proxy enabled."
 } else {
 	Remove-Item -LiteralPath "Env:$AnyrouterProxyEnv" -ErrorAction SilentlyContinue
 }

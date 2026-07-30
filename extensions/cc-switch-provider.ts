@@ -42,6 +42,7 @@ import {
 import {
 	ANYROUTER_PROXY_ENV,
 	isAnyrouterHttpsUrl,
+	isSelectiveProxyHttpsUrl,
 	resolveAnyrouterProxyUrl,
 } from "../lib/selective-proxy.ts";
 
@@ -244,47 +245,47 @@ const loadDiagnostics: { claude?: string; codex?: string } = {};
 // 避免 settings.json 非原子写入窗口导致单个请求瞬时回退到另一套默认凭据。
 let activeCcSwitchCliPaths: CcSwitchCliPaths | undefined;
 
-let anyrouterProxyAgent: ProxyAgent | undefined;
-let anyrouterProxyAgentUrl: string | undefined;
+let selectiveProxyAgent: ProxyAgent | undefined;
+let selectiveProxyAgentUrl: string | undefined;
 
 function ccSwitchCliPaths(): CcSwitchCliPaths {
 	return activeCcSwitchCliPaths ??= resolveCcSwitchCliPaths(homedir());
 }
 
-function configuredAnyrouterProxyUrl(): string | undefined {
+function configuredSelectiveProxyUrl(): string | undefined {
 	return resolveAnyrouterProxyUrl(process.env[ANYROUTER_PROXY_ENV]);
 }
 
-function anyrouterProxyAgentFor(proxyUrl: string): ProxyAgent {
-	if (anyrouterProxyAgent && anyrouterProxyAgentUrl === proxyUrl) return anyrouterProxyAgent;
+function selectiveProxyAgentFor(proxyUrl: string): ProxyAgent {
+	if (selectiveProxyAgent && selectiveProxyAgentUrl === proxyUrl) return selectiveProxyAgent;
 
-	const staleAgent = anyrouterProxyAgent;
-	anyrouterProxyAgent = new ProxyAgent(proxyUrl);
-	anyrouterProxyAgentUrl = proxyUrl;
+	const staleAgent = selectiveProxyAgent;
+	selectiveProxyAgent = new ProxyAgent(proxyUrl);
+	selectiveProxyAgentUrl = proxyUrl;
 	void staleAgent?.close().catch(() => undefined);
 
 	const displayUrl = new URL(proxyUrl).origin;
-	console.info(`[cc-switch] selective proxy enabled: https://anyrouter.top -> ${displayUrl}`);
-	return anyrouterProxyAgent;
+	console.info(`[cc-switch] selective proxy enabled: anyrouter.top, agentrouter.org -> ${displayUrl}`);
+	return selectiveProxyAgent;
 }
 
 async function fetchCcSwitch(url: string, init?: RequestInit): Promise<Response> {
-	if (!isAnyrouterHttpsUrl(url)) return fetch(url, init);
+	if (!isSelectiveProxyHttpsUrl(url)) return fetch(url, init);
 
-	const proxyUrl = configuredAnyrouterProxyUrl();
+	const proxyUrl = configuredSelectiveProxyUrl();
 	if (!proxyUrl) return fetch(url, init);
 
 	const response = await undiciFetch(url, {
 		...init,
-		dispatcher: anyrouterProxyAgentFor(proxyUrl),
+		dispatcher: selectiveProxyAgentFor(proxyUrl),
 	});
 	return response as unknown as Response;
 }
 
-function cleanupAnyrouterProxy(): void {
-	const agent = anyrouterProxyAgent;
-	anyrouterProxyAgent = undefined;
-	anyrouterProxyAgentUrl = undefined;
+function cleanupSelectiveProxy(): void {
+	const agent = selectiveProxyAgent;
+	selectiveProxyAgent = undefined;
+	selectiveProxyAgentUrl = undefined;
 	void agent?.close().catch(() => undefined);
 }
 
@@ -3431,7 +3432,7 @@ export default function (pi: ExtensionAPI) {
 		// Pi 会在 reload、新建/恢复/派生会话时重新加载扩展；必须清理当前实例，避免遗留幽灵保温任务。
 		// 进程级 enabledOverride 不在此处重置，确保当前窗口执行 /fc off 后跨会话重载仍保持关闭。
 		cleanupFcappKeepwarmRuntime();
-		cleanupAnyrouterProxy();
+		cleanupSelectiveProxy();
 		fcappKeepwarmStatusSink = undefined;
 	});
 

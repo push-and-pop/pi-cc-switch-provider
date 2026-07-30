@@ -212,7 +212,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 | Shortcut | Expands to | Purpose |
 |---|---|---|
 | `pi-models` | `pi --list-models cc-switch` | List cc-switch models quickly. |
-| `pi-codex` | automatic launcher | Start the cc-switch Codex provider; it detects `https://anyrouter.top/v1` and enables the host-only proxy for that launch. |
+| `pi-codex` | automatic launcher | Start the cc-switch Codex provider; it detects `https://anyrouter.top/v1` or `https://agentrouter.org/v1` and enables the host-only proxy for that launch. |
 | `pi-claude` | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | Start Pi with the cc-switch Claude provider quickly. |
 
 ### CC Switch Config Directories
@@ -223,16 +223,16 @@ Absolute paths and CC Switch's `~` forms are accepted. Ambiguous relative paths 
 
 ### Optional Outbound Network Proxy
 
-A local Clash/Mihomo HTTP proxy is an **outbound network proxy**, not a CC Switch API relay. HTTPS requests whose exact hostname is `anyrouter.top` use `http://127.0.0.1:7897` by default, so direct `pi` startup needs no proxy environment setup. To override the local proxy port, set the extension-specific variable before starting Pi:
+A local Clash/Mihomo HTTP proxy is an **outbound network proxy**, not a CC Switch API relay. HTTPS requests whose exact hostname is `anyrouter.top` or `agentrouter.org` use `http://127.0.0.1:7897` by default, so direct `pi` startup needs no proxy environment setup. To override the local proxy port, set the extension-specific variable before starting Pi:
 
 ```powershell
 $env:PI_CC_SWITCH_ANYROUTER_PROXY = "http://127.0.0.1:7897"
 pi
 ```
 
-Other hosts continue to use Pi's normal direct route. The proxy URL must use `http://` or `https://` and contain only an origin, without a path, query, or fragment. Set `PI_CC_SWITCH_ANYROUTER_PROXY=off` to make AnyRouter direct as well.
+Other hosts continue to use Pi's normal direct route. The proxy URL must use `http://` or `https://` and contain only an origin, without a path, query, or fragment. The legacy variable name is retained for compatibility; set `PI_CC_SWITCH_ANYROUTER_PROXY=off` to make both hosts direct.
 
-After running `scripts/install-shortcuts.ps1`, the `pi-codex` shortcut reads the active Codex `config.toml` before launching. When its selected `base_url` is exactly `https://anyrouter.top/v1` (a trailing slash is also accepted), it clears the process-wide proxy variables and enables the dedicated proxy automatically. Other base URLs launch with the existing environment unchanged.
+After running `scripts/install-shortcuts.ps1`, the `pi-codex` shortcut reads the active Codex `config.toml` before launching. When its selected `base_url` is exactly `https://anyrouter.top/v1` or `https://agentrouter.org/v1` (a trailing slash is also accepted), it clears the process-wide proxy variables and enables the dedicated proxy automatically. Other base URLs launch with the existing environment unchanged.
 
 `https://anyrouter.top/` is also a keepwarm entry. When AnyRouter is the active provider, keepwarm requests use the active AnyRouter URL and credentials only; they are not sent back to the FC host. When the FC host is active, the existing AnyRouter fallback behavior remains unchanged.
 
@@ -530,7 +530,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 | 快捷命令 | 展开后等价于 | 作用 |
 |---|---|---|
 | `pi-models` | `pi --list-models cc-switch` | 快速列出 cc-switch 模型。 |
-| `pi-codex` | 自动判断启动器 | 快速使用 cc-switch Codex provider；检测到 `https://anyrouter.top/v1` 时，本次启动自动启用单主机代理。 |
+| `pi-codex` | 自动判断启动器 | 快速使用 cc-switch Codex provider；检测到 `https://anyrouter.top/v1` 或 `https://agentrouter.org/v1` 时，本次启动自动启用单主机代理。 |
 | `pi-claude` | `pi --provider cc-switch-claude --model claude-sonnet-4-5` | 快速使用 cc-switch Claude provider 启动 Pi。 |
 
 ### CC Switch 配置目录
@@ -541,16 +541,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-shortcuts.ps1
 
 ### 可选的出站网络代理
 
-本机 Clash/Mihomo 的 HTTP 代理属于**出站网络代理**，不是 CC Switch API relay。精确主机名为 `anyrouter.top` 的 HTTPS 请求现在默认使用 `http://127.0.0.1:7897`，因此直接运行 `pi` 无需预先设置代理变量。如需修改本机代理端口，可在启动 Pi 前设置扩展专用变量：
+本机 Clash/Mihomo 的 HTTP 代理属于**出站网络代理**，不是 CC Switch API relay。精确主机名为 `anyrouter.top` 或 `agentrouter.org` 的 HTTPS 请求现在默认使用 `http://127.0.0.1:7897`，因此直接运行 `pi` 无需预先设置代理变量。如需修改本机代理端口，可在启动 Pi 前设置扩展专用变量：
 
 ```powershell
 $env:PI_CC_SWITCH_ANYROUTER_PROXY = "http://127.0.0.1:7897"
 pi
 ```
 
-其它主机继续使用 Pi 原来的直连路径。代理地址只支持 `http://` 或 `https://`，并且只能填写 origin，不能附带路径、查询参数或 fragment。如需让 AnyRouter 也直连，可设置 `PI_CC_SWITCH_ANYROUTER_PROXY=off`。
+其它主机继续使用 Pi 原来的直连路径。代理地址只支持 `http://` 或 `https://`，并且只能填写 origin，不能附带路径、查询参数或 fragment。为兼容已有配置，环境变量名称保持不变；如需让这两个域名都直连，可设置 `PI_CC_SWITCH_ANYROUTER_PROXY=off`。
 
-运行 `scripts/install-shortcuts.ps1` 后，`pi-codex` 快捷命令会在启动前读取当前 Codex `config.toml`。只有选中的 `base_url` 精确为 `https://anyrouter.top/v1`（允许末尾 `/`）时，才会清除本次进程的全局代理变量并自动启用专用代理；其它地址保持原环境启动。
+运行 `scripts/install-shortcuts.ps1` 后，`pi-codex` 快捷命令会在启动前读取当前 Codex `config.toml`。只有选中的 `base_url` 精确为 `https://anyrouter.top/v1` 或 `https://agentrouter.org/v1`（允许末尾 `/`）时，才会清除本次进程的全局代理变量并自动启用专用代理；其它地址保持原环境启动。
 
 `https://anyrouter.top/` 现在也属于保温入口。当前 Provider 为 AnyRouter 时，保温只使用当前 AnyRouter 地址和凭据，不会把凭据反向发送给 FC；当前 Provider 为 FC 时，原有的 AnyRouter 备用入口行为保持不变。
 
