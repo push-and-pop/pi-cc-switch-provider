@@ -70,6 +70,8 @@ Routing defaults to `live` to preserve the existing behavior. In this mode every
 
 `fixed` captures the complete Codex and Claude configuration when the extension loads. Later cc-switch changes do not affect requests, the footer, status output, or keepwarm routing until Pi restarts or `/reload` runs. `/cc-switch live`, `/cc-switch fixed`, and `/cc-switch toggle` persist only `routingMode` in `%USERPROFILE%\.pi\agent\cc-switch-provider.json` and automatically reload the extension; API keys remain in memory and are never copied into that file. Existing `codexSummary` and unknown extension fields are preserved.
 
+Set `hideRoutingStatus: true` in the same `cc-switch-provider.json` file to suppress the "中转: 固定快照" / "中转: 实时跟随" routing indicator that the extension otherwise shows in the Pi footer. When omitted or `false`, the indicator is displayed as before. This key is a boolean flag only (anything other than `true` is treated as not set) and does not affect routing behavior or the `/cc-switch` command output.
+
 ### Pi Built-in CLI Commands
 
 General syntax:
@@ -387,6 +389,8 @@ pi --provider cc-switch-claude --model mimo-v2.5-pro
 默认使用 `live` 实时跟随模式，以保持原有行为。该模式会在每次 Codex Responses 和 Claude 请求前读取 cc-switch 当前输出文件，并从同一份配置中取得中转地址、凭据、模型、reasoning 和鉴权方式。
 
 `fixed` 固定模式会在扩展加载时捕获 Codex、Claude 的完整配置快照。此后 cc-switch 的切换不会影响请求、页脚、状态输出和保温路由，直到重启 Pi 或执行 `/reload`。`/cc-switch live`、`/cc-switch fixed`、`/cc-switch toggle` 只会将 `routingMode` 持久化到 `%USERPROFILE%\.pi\agent\cc-switch-provider.json`，随后自动 reload 扩展；API Key 只保留在内存中，不会复制到该文件。已有 `codexSummary` 和未知扩展字段会原样保留。
+
+如需隐藏 Pi 页脚中的路由指示（`中转: 固定快照` / `中转: 实时跟随`），在同一份 `cc-switch-provider.json` 中设置 `"hideRoutingStatus": true` 即可；缺省或为 `false` 时照常显示。该字段是纯布尔开关（非 `true` 一律视为未设置），不影响中转行为，也不影响 `/cc-switch` 命令输出。
 
 ### Pi 内置 CLI 命令
 

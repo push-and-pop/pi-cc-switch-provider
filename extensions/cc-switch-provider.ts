@@ -3245,7 +3245,7 @@ export default function (pi: ExtensionAPI) {
 	// Re-evaluate device-local directory overrides and capture one coherent registration snapshot on every load/reload.
 	activeCcSwitchCliPaths = resolveCcSwitchCliPaths(homedir());
 	const localConfigPath = ccSwitchProviderConfigPath();
-	const routingMode = readCcSwitchProviderLocalConfig(localConfigPath).routingMode;
+	const { routingMode, hideRoutingStatus } = readCcSwitchProviderLocalConfig(localConfigPath);
 	const routingSnapshot = captureProviderRoutingSnapshot();
 	applyProviderRoutingDiagnostics(routingSnapshot);
 
@@ -3438,7 +3438,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		installCcSwitchFooter(pi, ctx, routingMode, routingSnapshot.codex);
-		ctx.ui.setStatus(CC_SWITCH_ROUTING_STATUS_KEY, routingModeFooterStatus(routingMode));
+		if (!hideRoutingStatus) {
+			ctx.ui.setStatus(CC_SWITCH_ROUTING_STATUS_KEY, routingModeFooterStatus(routingMode));
+		}
 		fcappKeepwarmStatusSink = (text) => ctx.ui.setStatus(FCAPP_KEEPWARM_STATUS_KEY, text);
 		fcappKeepwarmStatusSink(fcappKeepwarmStatusText);
 	});

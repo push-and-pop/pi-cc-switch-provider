@@ -5,6 +5,7 @@ export type CcSwitchRoutingMode = "live" | "fixed";
 
 export interface CcSwitchProviderLocalConfig {
 	routingMode: CcSwitchRoutingMode;
+	hideRoutingStatus?: boolean;
 	codexSummary?: {
 		baseUrl?: string;
 	};
@@ -42,7 +43,7 @@ export function parseCcSwitchRoutingMode(value: unknown, filePath?: string): CcS
 
 export function readCcSwitchProviderLocalConfig(filePath: string): CcSwitchProviderLocalConfig {
 	if (!existsSync(filePath)) {
-		return { routingMode: DEFAULT_CC_SWITCH_ROUTING_MODE };
+		return { routingMode: DEFAULT_CC_SWITCH_ROUTING_MODE, hideRoutingStatus: false };
 	}
 
 	const config = readConfigObject(filePath);
@@ -52,6 +53,7 @@ export function readCcSwitchProviderLocalConfig(filePath: string): CcSwitchProvi
 	const codexSummary = isRecord(config.codexSummary) ? config.codexSummary : undefined;
 	return {
 		routingMode: parseCcSwitchRoutingMode(config.routingMode, filePath),
+		hideRoutingStatus: config.hideRoutingStatus === true,
 		codexSummary: codexSummary
 			? { baseUrl: nonEmptyString(codexSummary.baseUrl) }
 			: undefined,

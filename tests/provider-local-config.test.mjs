@@ -25,6 +25,7 @@ test("missing local config defaults to live routing", () => {
 		const configPath = join(directory, "nested", "cc-switch-provider.json");
 		assert.deepEqual(readCcSwitchProviderLocalConfig(configPath), {
 			routingMode: DEFAULT_CC_SWITCH_ROUTING_MODE,
+			hideRoutingStatus: false,
 		});
 		assert.equal(parseCcSwitchRoutingMode(undefined), "live");
 	});
@@ -39,8 +40,31 @@ test("local config reads fixed mode without changing codex summary settings", ()
 		}), "utf8");
 		assert.deepEqual(readCcSwitchProviderLocalConfig(configPath), {
 			routingMode: "fixed",
+			hideRoutingStatus: false,
 			codexSummary: { baseUrl: "https://summary.test/v1" },
 		});
+	});
+});
+
+test("local config reads hideRoutingStatus flag", () => {
+	withTempDirectory((directory) => {
+		const configPath = join(directory, "cc-switch-provider.json");
+		writeFileSync(configPath, JSON.stringify({
+			routingMode: "fixed",
+			hideRoutingStatus: true,
+		}), "utf8");
+		assert.deepEqual(readCcSwitchProviderLocalConfig(configPath), {
+			routingMode: "fixed",
+			hideRoutingStatus: true,
+			codexSummary: undefined,
+		});
+
+		// 非 true 值（如字符串/数字）一律视为未设置，不抛错。
+		writeFileSync(configPath, JSON.stringify({
+			routingMode: "fixed",
+			hideRoutingStatus: "yes",
+		}), "utf8");
+		assert.equal(readCcSwitchProviderLocalConfig(configPath).hideRoutingStatus, false);
 	});
 });
 
